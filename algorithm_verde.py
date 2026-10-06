@@ -3,31 +3,85 @@
 Algoritmo de Processing: hileras y fallas por cuartel, basado en el verdor.
 El método está en verde.py.
 """
+import csv
 import math
+import os
 
 import numpy as np
 
 from qgis.core import (
     Qgis,
     QgsFeature,
-    QgsFeatureSink,
     QgsField,
     QgsFields,
     QgsGeometry,
     QgsPointXY,
-    QgsProcessing,
+    QgsCategorizedSymbolRenderer,
+    QgsFillSymbol,
+    QgsLineSymbol,
+    QgsMarkerSymbol,
     QgsProcessingAlgorithm,
+    QgsProcessingContext,
     QgsProcessingException,
+    QgsProcessingLayerPostProcessorInterface,
     QgsProcessingParameterBand,
+    QgsProcessingParameterBoolean,
     QgsProcessingParameterEnum,
-    QgsProcessingParameterFeatureSink,
+    QgsProcessingParameterFolderDestination,
     QgsProcessingParameterNumber,
     QgsProcessingParameterRasterLayer,
-    QgsWkbTypes,
+    QgsRendererCategory,
+    QgsVectorFileWriter,
+    QgsVectorLayer,
 )
 from qgis.PyQt.QtCore import QVariant
 
 from . import verde as V
+
+
+GROUP_NAME = "Hileras y fallas (verde)"
+# clave: (archivo, nombre en el proyecto, geometría, se carga siempre)
+LAYERS = {
+    "blocks": ("cuarteles.gpkg", "Cuarteles", "Polygon", True),
+    "adj": ("hileras_ajustadas.gpkg", "Hileras ajustadas", "LineString", True),
+    "gaps": ("fallas.gpkg", "Fallas", "LineString", True),
+    "buffer": ("buffer_final.gpkg", "Buffer final", "Polygon", False),
+    "init": ("hileras_iniciales.gpkg", "Hileras iniciales", "LineString", False),
+    "peaks": ("picos_verde.gpkg", "Picos de verde (1.ª pasada)", "Point", False),
+}
+_STYLERS = []        # los post-procesadores tienen que seguir vivos hasta que se cargan las capas
+
+
+class _Styler(QgsProcessingLayerPostProcessorInterface):
+    """Aplica a cada capa de salida la simbología del proceso."""
+
+    def __init__(self, key, name):
+        super().__init__()
+        self.key = key
+        self.name = name
+
+    def postProcessLayer(self, layer, context, feedback):
+        k = self.key
+        layer.setName(self.name)
+        if k == "blocks":
+            layer.renderer().setSymbol(QgsFillSymbol.createSimple(
+                {"color": "0,0,0,0", "outline_color": "#ffd400", "outline_width": "0.8"}))
+        elif k == "adj":
+            layer.renderer().setSymbol(QgsLineSymbol.createSimple({"color": "#00e5ff", "width": "0.35"}))
+        elif k == "init":
+            layer.renderer().setSymbol(QgsLineSymbol.createSimple({"color": "#ff00ff", "width": "0.25"}))
+        elif k == "buffer":
+            layer.renderer().setSymbol(QgsFillSymbol.createSimple(
+                {"color": "0,200,255,50", "outline_color": "0,160,255,200", "outline_width": "0.1"}))
+        elif k == "peaks":
+            layer.renderer().setSymbol(QgsMarkerSymbol.createSimple({"color": "#ffff00", "size": "1.2", "outline_style": "no"}))
+        elif k == "gaps":
+            layer.setRenderer(QgsCategorizedSymbolRenderer("borde", [
+                QgsRendererCategory(0, QgsLineSymbol.createSimple({"color": "#ff2020", "width": "0.9"}), "falla interior"),
+                QgsRendererCategory(1, QgsLineSymbol.createSimple({"color": "#ff9800", "width": "0.9"}),
+                                    "falla de borde (a <2 m del extremo)")]))
+        layer.triggerRepaint()
+        return True
 
 
 class HilerasFallasVerdeAlgorithm(QgsProcessingAlgorithm):
@@ -45,12 +99,8 @@ class HilerasFallasVerdeAlgorithm(QgsProcessingAlgorithm):
     RESID = "RESID"
     THRESHOLD = "THRESHOLD"
     MIN_GAP = "MIN_GAP"
-    OUT_BLOCKS = "OUT_BLOCKS"
-    OUT_INIT = "OUT_INIT"
-    OUT_ADJ = "OUT_ADJ"
-    OUT_BUFFER = "OUT_BUFFER"
-    OUT_GAPS = "OUT_GAPS"
-    OUT_PEAKS = "OUT_PEAKS"
+    LOAD_ALL = "LOAD_ALL"
+    OUT_FOLDER = "OUT_FOLDER"
 
     def name(self):
         return "hileras_y_fallas_verde"
@@ -122,21 +172,29 @@ class HilerasFallasVerdeAlgorithm(QgsProcessingAlgorithm):
         self.addParameter(QgsProcessingParameterNumber(
             self.MIN_GAP, "Largo mínimo de una falla (m)",
             QgsProcessingParameterNumber.Double, 2.0, minValue=0.1))
-        self.addParameter(QgsProcessingParameterFeatureSink(
-            self.OUT_BLOCKS, "Cuarteles (polígonos)", QgsProcessing.TypeVectorPolygon))
-        self.addParameter(QgsProcessingParameterFeatureSink(
-            self.OUT_ADJ, "Hileras ajustadas (líneas)", QgsProcessing.TypeVectorLine))
-        self.addParameter(QgsProcessingParameterFeatureSink(
-            self.OUT_GAPS, "Fallas (líneas)", QgsProcessing.TypeVectorLine))
-        self.addParameter(QgsProcessingParameterFeatureSink(
-            self.OUT_BUFFER, "Buffer final alrededor de las hileras ajustadas (polígonos)",
-            QgsProcessing.TypeVectorPolygon, optional=True, createByDefault=False))
-        self.addParameter(QgsProcessingParameterFeatureSink(
-            self.OUT_INIT, "Hileras iniciales (líneas)", QgsProcessing.TypeVectorLine,
-            optional=True, createByDefault=False))
-        self.addParameter(QgsProcessingParameterFeatureSink(
-            self.OUT_PEAKS, "Picos de verde de la primera pasada (puntos)", QgsProcessing.TypeVectorPoint,
-            optional=True, createByDefault=False))
+        self.addParameter(QgsProcessingParameterBoolean(
+            self.LOAD_ALL,
+            "Cargar también las capas de las etapas intermedias (buffer final, hileras iniciales y picos)",
+            defaultValue=False))
+        self.addParameter(QgsProcessingParameterFolderDestination(
+            self.OUT_FOLDER, "Carpeta de resultados (se guardan ahí todas las capas, el resumen por cuartel y se cargan en un grupo)"))
+
+    @staticmethod
+    def _queue_load(context, outputs, load_all):
+        """Pide cargar al terminar las capas ya escritas en la carpeta: en un grupo,
+        con su nombre y simbología, y con las fallas arriba y los cuarteles abajo."""
+        order = ["blocks", "init", "buffer", "peaks", "adj", "gaps"]       # de abajo hacia arriba
+        for i, key in enumerate(order):
+            fn, nm, geom, always = LAYERS[key]
+            if key not in outputs or not (always or load_all):
+                continue
+            details = QgsProcessingContext.LayerDetails(nm, context.project(), key)
+            details.groupName = GROUP_NAME
+            details.layerSortKey = i
+            styler = _Styler(key, nm)
+            _STYLERS.append(styler)
+            details.setPostProcessor(styler)
+            context.addLayerToLoadOnCompletion(outputs[key], details)
 
     @staticmethod
     def _fields(*spec):
@@ -189,21 +247,20 @@ class HilerasFallasVerdeAlgorithm(QgsProcessingAlgorithm):
         f_buf = self._fields(("cuartel", I), ("hilera", I), ("ancho_m", D))
         f_ini = self._fields(("cuartel", I), ("hilera", I), ("longitud_m", D))
         f_pk = self._fields(("cuartel", I), ("hilera", I), ("desvio_m", D))
-        sk = {}
-        for key, fields, geom in ((self.OUT_BLOCKS, f_blk, QgsWkbTypes.Polygon), (self.OUT_ADJ, f_line, QgsWkbTypes.LineString),
-                                  (self.OUT_GAPS, f_gap, QgsWkbTypes.LineString), (self.OUT_BUFFER, f_buf, QgsWkbTypes.Polygon),
-                                  (self.OUT_INIT, f_ini, QgsWkbTypes.LineString), (self.OUT_PEAKS, f_pk, QgsWkbTypes.Point)):
-            sk[key] = self.parameterAsSink(parameters, key, context, fields, geom, crs)
-        out = {key: dest for key, (sink, dest) in sk.items() if dest}
+        fields_of = {"blocks": f_blk, "adj": f_line, "gaps": f_gap, "buffer": f_buf, "init": f_ini, "peaks": f_pk}
+        mem = {}
+        for key, (fn, nm, geom, _) in LAYERS.items():
+            ml = QgsVectorLayer("%s?crs=%s" % (geom, crs.authid() or crs.toWkt()), nm, "memory")
+            ml.dataProvider().addAttributes(fields_of[key].toList())
+            ml.updateFields()
+            mem[key] = ml
+        pend = {key: [] for key in LAYERS}
 
         def add(key, fields, geom, attrs):
-            sink = sk[key][0]
-            if sink is None:
-                return
-            ft = QgsFeature(fields)
+            ft = QgsFeature(mem[key].fields())
             ft.setGeometry(geom)
             ft.setAttributes(attrs)
-            sink.addFeature(ft, QgsFeatureSink.FastInsert)
+            pend[key].append(ft)
 
         def xy(frame, u, v):
             x, y = frame.to_xy(u, v)
@@ -219,39 +276,80 @@ class HilerasFallasVerdeAlgorithm(QgsProcessingAlgorithm):
             pct = 100.0 * sum(g["largo"] for g in fa) / tot if tot else None
             pct_sb = 100.0 * sum(g["largo"] for g in fa if not g["borde"]) / tot if tot else None
             poly = QgsGeometry.fromPolygonXY([[QgsPointXY(*px2map(x, y)) for x, y in r["ring"]]])
-            add(self.OUT_BLOCKS, f_blk, poly, [
+            add("blocks", f_blk, poly, [
                 c, round(r["area_ha"], 3), round(az, 2), round(est["per_m"], 3), est["index"],
                 r["dist_plantas"], None if r["buffer"] is None else round(r["buffer"], 2),
                 len(r["rows_final"]), None if pct is None else round(pct, 2), None if pct_sb is None else round(pct_sb, 2)])
             for row in r["rows_ini"]:
                 p = xy(frame, row.uk, row.vk)
-                add(self.OUT_INIT, f_ini, QgsGeometry.fromPolylineXY([p[0], p[-1]]), [c, int(row.hilera), round(p[0].distance(p[-1]), 2)])
+                add("init", f_ini, QgsGeometry.fromPolylineXY([p[0], p[-1]]), [c, int(row.hilera), round(p[0].distance(p[-1]), 2)])
             for row, inf in zip(r["rows"], r["infos"]):
                 if row.u1 - row.u0 < 4.0:                       # fragmentos del borde del polígono
                     continue
                 ok = bool(inf["aceptada"])
-                add(self.OUT_ADJ, f_line, QgsGeometry.fromPolylineXY(xy(frame, row.uk, row.vk)),
+                add("adj", f_line, QgsGeometry.fromPolylineXY(xy(frame, row.uk, row.vk)),
                     [c, int(row.hilera), int(ok), int(inf["quiebres"]) if ok else 0,
                      None if np.isnan(inf["cv_ini"]) else round(inf["cv_ini"], 3),
                      None if np.isnan(inf["cv_nueva"]) else round(inf["cv_nueva"], 3)])
-                if "peaks" in inf and sk[self.OUT_PEAKS][0] is not None:
+                if "peaks" in inf:
                     uc, vc, dd = inf["peaks"]
                     for a, b, e in zip(*frame.to_xy(uc, vc), dd):
-                        add(self.OUT_PEAKS, f_pk, QgsGeometry.fromPointXY(QgsPointXY(float(a), float(b))),
+                        add("peaks", f_pk, QgsGeometry.fromPointXY(QgsPointXY(float(a), float(b))),
                             [c, int(row.hilera), round(float(e), 3)])
             if r["buffer"] is not None:
                 for row in r["rows_final"]:
                     g = QgsGeometry.fromPolylineXY(xy(frame, row.uk, row.vk)).buffer(
                         r["buffer"], 4, Qgis.EndCapStyle.Flat, Qgis.JoinStyle.Round, 2.0)
-                    add(self.OUT_BUFFER, f_buf, g, [c, int(row.hilera), round(2 * r["buffer"], 2)])
+                    add("buffer", f_buf, g, [c, int(row.hilera), round(2 * r["buffer"], 2)])
             for g in fa:
                 us = np.array([g["ua"], g["ub"]])
                 pts = xy(frame, us, np.interp(us, g["row"].uk, g["row"].vk))
-                add(self.OUT_GAPS, f_gap, QgsGeometry.fromPolylineXY(pts),
+                add("gaps", f_gap, QgsGeometry.fromPolylineXY(pts),
                     [c, int(g["row"].hilera), round(float(g["ua"] - g["row"].uk[0]), 2), round(g["largo"], 2),
                      round(g["z"], 3), g["borde"]])
             feedback.pushInfo(
                 "Cuartel %d: %.2f ha, %s, hileras cada %.2f m (rumbo %.1f°), buffer ±%.2f m; %d fallas = %.1f%% del largo de "
                 "hileras (%.1f%% sin las de borde)." % (
                     c, r["area_ha"], est["index"], est["per_m"], az, r["buffer"] or 0.0, len(fa), pct or 0.0, pct_sb or 0.0))
-        return out
+
+        # --- escribir todo en la carpeta, resumen por cuartel y carga de las capas -----------------
+        folder = self.parameterAsString(parameters, self.OUT_FOLDER, context)
+        os.makedirs(folder, exist_ok=True)
+        load_all = self.parameterAsBool(parameters, self.LOAD_ALL, context)
+        outputs = {self.OUT_FOLDER: folder}
+        opts = QgsVectorFileWriter.SaveVectorOptions()
+        opts.driverName = "GPKG"
+        opts.fileEncoding = "utf-8"
+        opts.actionOnExistingFile = QgsVectorFileWriter.CreateOrOverwriteFile
+        for key, (fn, nm, geom, always) in LAYERS.items():
+            mem[key].dataProvider().addFeatures(pend[key])
+            path = os.path.join(folder, fn)
+            err = QgsVectorFileWriter.writeAsVectorFormatV3(mem[key], path, context.transformContext(), opts)
+            if err[0] != QgsVectorFileWriter.NoError:
+                raise QgsProcessingException("No se pudo escribir %s: %s" % (path, err[1]))
+            outputs[key] = path
+        self._queue_load(context, outputs, load_all)
+        resumen = os.path.join(folder, "resumen_cuarteles.csv")
+        with open(resumen, "w", newline="", encoding="utf-8") as fh:
+            w = csv.writer(fh)
+            w.writerow(["cuartel", "area_ha", "rumbo_deg", "distancia_entre_hileras_m", "indice", "dist_plantas_m", "buffer_m",
+                        "hileras", "fallas", "largo_fallas_m", "fallas_pct_del_largo", "fallas_sin_borde_pct",
+                        "lineas_aceptadas_pct", "desvio_al_pico_ini_m", "desvio_al_pico_nueva_m"])
+            for r in res:
+                est, fa = r["est"], r["fallas"]
+                th = math.radians(est["ang"])
+                az = math.degrees(math.atan2(gt[1] * math.cos(th), gt[5] * math.sin(th))) % 180.0
+                tot = r["n_samples"] * 0.1
+                ci = np.array([i["cv_ini"] for i in r["infos"]], float)
+                cn = np.array([i["cv_nueva"] for i in r["infos"]], float)
+                acc = np.array([i["aceptada"] for i in r["infos"]], float)
+                w.writerow([r["cuartel"], round(r["area_ha"], 3), round(az, 2), round(est["per_m"], 3), est["index"],
+                            "" if r["dist_plantas"] is None else round(r["dist_plantas"], 2),
+                            "" if r["buffer"] is None else round(r["buffer"], 2), len(r["rows_final"]), len(fa),
+                            round(sum(g["largo"] for g in fa), 1),
+                            round(100.0 * sum(g["largo"] for g in fa) / tot, 2) if tot else "",
+                            round(100.0 * sum(g["largo"] for g in fa if not g["borde"]) / tot, 2) if tot else "",
+                            round(100.0 * acc.mean(), 1), round(float(np.nanmedian(ci)), 3), round(float(np.nanmedian(cn)), 3)])
+        outputs["RESUMEN"] = resumen
+        feedback.pushInfo("Resultados guardados en %s (capas .gpkg y resumen_cuarteles.csv)." % folder)
+        return outputs

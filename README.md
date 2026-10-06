@@ -45,12 +45,21 @@ VARI, GLI y NGRDI (el que más marca el patrón). Con una banda infrarroja
 
 ### Salidas
 
-| Salida | Contenido |
+Se elige una **carpeta de resultados** y el algoritmo deja ahí todo, y además
+carga las capas principales en el proyecto, en un grupo "Hileras y fallas
+(verde)", con nombre y simbología (fallas interiores en rojo y de borde en
+naranja, hileras ajustadas en celeste, cuarteles con contorno amarillo; las
+fallas arriba). Con la opción "Cargar también las capas de las etapas
+intermedias" se cargan además el buffer final, las hileras iniciales y los
+picos.
+
+| Archivo de la carpeta | Contenido |
 |---|---|
-| Cuarteles | polígono, rumbo, distancia, índice, distancia entre plantas, buffer, % de fallas (con y sin borde) |
-| Hileras ajustadas | línea de cada hilera; `ajustada` (0/1), `quiebres`, desvío al pico antes y después (validación cruzada) |
-| Fallas | tramo, largo, vigor y `borde` |
-| Buffer final, hileras iniciales, picos (opcionales) | para revisar cada etapa |
+| `cuarteles.gpkg` | polígono, rumbo, distancia, índice, distancia entre plantas, buffer, % de fallas (con y sin borde) |
+| `hileras_ajustadas.gpkg` | línea de cada hilera; `ajustada` (0/1), `quiebres`, desvío al pico antes y después (validación cruzada) |
+| `fallas.gpkg` | tramo, largo, vigor y `borde` |
+| `buffer_final.gpkg`, `hileras_iniciales.gpkg`, `picos_verde.gpkg` | para revisar cada etapa |
+| `resumen_cuarteles.csv` | una fila por cuartel con lo anterior en tabla |
 
 Las **fallas de borde** (a menos de 2 m del extremo de la hilera) se marcan
 aparte: dependen de cuánto se pasa el polígono del cuartel de la última planta,
