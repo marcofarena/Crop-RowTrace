@@ -341,7 +341,7 @@ def refine_period(img, ok, ang, per0_px, rel=0.06):
             best = (abs(z), T, float(np.angle(z)))
     amp, T, ph = best
     # los máximos del perfil están en v = v0 + k T con v0 = ph T / 2pi
-    v0 = (ph / (2 * math.pi)) * T
+    v0 = -(ph / (2 * math.pi)) * T
     return T, v0, 2.0 * amp / max(float(prof.std()) * math.sqrt(2.0), 1e-9)
 
 
@@ -369,3 +369,67 @@ def estimate_rows(imgs, mask, pixel_size, period_range_m=(1.0, 8.0)):
     T, v0, amp = refine_period(img, ok, ang, T0)
     return {"index": nm, "ang": ang, "per_px": T, "per_m": T * pixel_size, "v0": v0,
             "ring": ring, "amp": amp, "ang0": a0, "per0_m": T0 * pixel_size}
+
+
+# ---------------------------------------------------------------------------
+# Etapa 3: líneas iniciales
+# ---------------------------------------------------------------------------
+def initial_rows(ring, ang, per_px, v0, shape=None):
+    """
+    Una recta por hilera (paralelas, a distancia per_px) con el rumbo ang
+    (grados, coordenadas de imagen), recortadas al contorno ring (px). Las
+    coordenadas son las de la imagen de trabajo: la hilera k es el conjunto
+    de puntos con  v = -x sin(ang) + y cos(ang) = v0 + k per_px.
+    Devuelve [(k, [(x1, y1, x2, y2), ...])]: una hilera puede tener varios
+    tramos si el contorno es cóncavo.
+    """
+    from qgis.core import QgsGeometry, QgsPointXY
+    th = math.radians(ang)
+    d = np.array([math.cos(th), math.sin(th)])
+    n = np.array([-math.sin(th), math.cos(th)])
+    poly = QgsGeometry.fromPolygonXY([[QgsPointXY(x, y) for x, y in ring]])
+    if not poly.isGeosValid():
+        poly = poly.makeValid()
+    pts = np.array(ring)
+    vs, us = pts @ n, pts @ d
+    k0 = int(math.ceil((vs.min() - v0) / per_px))
+    k1 = int(math.floor((vs.max() - v0) / per_px))
+    ext = (us.max() - us.min()) + 10.0
+    uc = 0.5 * (us.max() + us.min())
+    rows = []
+    for k in range(k0, k1 + 1):
+        vk = v0 + k * per_px
+        a = vk * n + (uc - ext) * d
+        b = vk * n + (uc + ext) * d
+        inter = poly.intersection(QgsGeometry.fromPolylineXY([QgsPointXY(*a), QgsPointXY(*b)]))
+        parts = inter.asMultiPolyline() if inter.isMultipart() else ([inter.asPolyline()] if not inter.isEmpty() else [])
+        segs = [(p[0].x(), p[0].y(), p[-1].x(), p[-1].y()) for p in parts if len(p) >= 2]
+        if segs:
+            rows.append((k, segs))
+    return rows
+
+
+def refine_phase(img, ring, ang, per_px, v0, span=0.3):
+    """Corre la fase de las hileras hasta donde el verdor medio sobre las líneas
+    es máximo (dentro de +-span períodos): el máximo del perfil real no coincide
+    exactamente con la fase de su primera armónica. Devuelve el nuevo v0."""
+    H, W = img.shape
+    th = math.radians(ang)
+    n = np.array([-math.sin(th), math.cos(th)])
+    rows = initial_rows(ring, ang, per_px, v0)
+    pts = []
+    for k, segs in rows:
+        for (x1, y1, x2, y2) in segs:
+            m = max(2, int(math.hypot(x2 - x1, y2 - y1)))
+            t = np.linspace(0, 1, m)
+            pts.append(np.stack([x1 + (x2 - x1) * t, y1 + (y2 - y1) * t], axis=1))
+    P = np.concatenate(pts)
+    best = (-1e9, 0.0)
+    for s in np.arange(-span, span + 1e-9, 0.01) * per_px:
+        xs, ys = P[:, 0] + s * n[0], P[:, 1] + s * n[1]
+        c = np.clip(xs.astype(int), 0, W - 1)
+        r = np.clip(ys.astype(int), 0, H - 1)
+        v = img[r, c]
+        if np.isfinite(v).any() and np.nanmean(v) > best[0]:
+            best = (float(np.nanmean(v)), float(s))
+    return v0 + best[1]
