@@ -228,3 +228,144 @@ def detect_blocks(imgs, valid, pixel_size, period_range_m=(1.0, 8.0), min_area_h
     out.sort(key=lambda b: (round(float(np.mean([p[1] for p in b["ring"]])) * pixel_size / 50.0),
                             float(np.mean([p[0] for p in b["ring"]]))))
     return out
+
+
+# ---------------------------------------------------------------------------
+# Etapa 2: rumbo y distancia entre hileras de un cuartel
+# ---------------------------------------------------------------------------
+def rasterize(ring, shape):
+    """Máscara booleana de un contorno (lista de (x, y) en píxeles)."""
+    import cv2
+    m = np.zeros(shape, np.uint8)
+    cv2.fillPoly(m, [np.round(np.array(ring)).astype(np.int32)], 1)
+    return m > 0
+
+
+def _spectrum_peak(img, mask, pmin_px, pmax_px, tile=128, max_tiles=24):
+    """Espectro promedio (Welch) de las ventanas dentro de la máscara y su pico:
+    (rumbo imagen en grados, período en px, veces que sobresale de su anillo)."""
+    H, W = img.shape
+    ok = mask & np.isfinite(img)
+    tile = int(min(tile, H, W))
+    if tile < 32:
+        return None
+    step = max(1, tile // 2)
+    cands = [(y, x) for y in range(0, H - tile + 1, step) for x in range(0, W - tile + 1, step)
+             if ok[y:y + tile, x:x + tile].mean() >= 0.7]
+    if not cands:
+        return None
+    sel = np.unique(np.linspace(0, len(cands) - 1, min(max_tiles, len(cands))).round().astype(int))
+    win = np.outer(np.hanning(tile), np.hanning(tile))
+    acc = np.zeros((tile, tile))
+    for i in sel:
+        y, x = cands[i]
+        v = ok[y:y + tile, x:x + tile]
+        p = img[y:y + tile, x:x + tile].astype(np.float64)
+        p = np.where(v, p, p[v].mean())
+        acc += np.abs(np.fft.fft2((p - p.mean()) * win)) ** 2
+    fy = np.fft.fftfreq(tile)[:, None]
+    fx = np.fft.fftfreq(tile)[None, :]
+    fr = np.hypot(fx, fy)
+    band = (fr >= max(1.0 / pmax_px, 3.0 / tile)) & (fr <= 1.0 / pmin_px) & (fr <= 0.5)
+    m = np.where(band, acc, 0.0)
+    iy, ix = np.unravel_index(int(np.argmax(m)), m.shape)
+    ys = [(iy + d) % tile for d in (-1, 0, 1)]
+    xs = [(ix + d) % tile for d in (-1, 0, 1)]
+    blk = acc[np.ix_(ys, xs)]
+    fyk = fy[ys, 0][:, None] + 0 * blk
+    fxk = fx[0, xs][None, :] + 0 * blk
+    fyk = np.where(np.abs(fyk - fy[iy, 0]) > 0.5, fyk - np.sign(fyk), fyk)
+    fxk = np.where(np.abs(fxk - fx[0, ix]) > 0.5, fxk - np.sign(fxk), fxk)
+    s = blk.sum()
+    fyc, fxc = float((blk * fyk).sum() / s), float((blk * fxk).sum() / s)
+    rbin = np.round(fr * tile).astype(np.int64)
+    ring_vals = acc[(rbin == rbin[iy, ix]) & band]
+    ring = float(acc[iy, ix] / max(float(np.median(ring_vals)), 1e-30))
+    return (math.degrees(math.atan2(fyc, fxc)) + 90.0) % 180.0, 1.0 / math.hypot(fxc, fyc), ring
+
+
+def _profile_vs_angle(img, ok, ang_deg, per_px, max_samples=1500000):
+    ys, xs = np.nonzero(ok)
+    st = max(1, len(xs) // max_samples)
+    ys, xs = ys[::st].astype(np.float64), xs[::st].astype(np.float64)
+    vals = img[ok][::st].astype(np.float64)
+    return xs, ys, vals
+
+
+def refine_angle(img, ok, ang0, per_px, span=1.5):
+    """Afina el rumbo: el ángulo donde el perfil perpendicular tiene más
+    contraste (varianza del verdor medio según la distancia a la hilera)."""
+    xs, ys, vals = _profile_vs_angle(img, ok, ang0, per_px)
+    bw = max(per_px / 12.0, 0.25)
+
+    def score(a):
+        th = math.radians(a)
+        t = -xs * math.sin(th) + ys * math.cos(th)
+        k = ((t - t.min()) / bw).astype(np.int64)
+        c = np.bincount(k).astype(np.float64)
+        s = np.bincount(k, vals)
+        m = c > 0
+        prof = s[m] / c[m]
+        w = c[m]
+        mu = (prof * w).sum() / w.sum()
+        return float((w * (prof - mu) ** 2).sum() / w.sum())
+
+    best, sp, stp = float(ang0), float(span), float(span) / 10.0
+    for _ in range(3):
+        cs = best + np.arange(-sp, sp + 1e-9, stp)
+        best = float(cs[int(np.argmax([score(a) for a in cs]))])
+        sp, stp = stp, stp / 5.0
+    return best % 180.0
+
+
+def refine_period(img, ok, ang, per0_px, rel=0.06):
+    """Período y fase de las hileras con el rumbo ya fijo: periodograma fino
+    del perfil perpendicular. Devuelve (período px, fase v0 px, amplitud
+    relativa al contraste del perfil)."""
+    xs, ys, vals = _profile_vs_angle(img, ok, ang, per0_px)
+    th = math.radians(ang)
+    t = -xs * math.sin(th) + ys * math.cos(th)
+    bw = per0_px / 16.0
+    k = ((t - t.min()) / bw).astype(np.int64)
+    c = np.bincount(k).astype(np.float64)
+    s = np.bincount(k, vals)
+    m = c > 8
+    v = (np.nonzero(m)[0] + 0.5) * bw + t.min()
+    prof = s[m] / c[m]
+    prof = prof - prof.mean()
+    w = np.sqrt(c[m])
+    best = (0.0, per0_px, 0.0)
+    for T in per0_px * np.arange(1 - rel, 1 + rel + 1e-9, 0.001):
+        z = (prof * w * np.exp(-2j * np.pi * v / T)).sum() / w.sum()
+        if abs(z) > best[0]:
+            best = (abs(z), T, float(np.angle(z)))
+    amp, T, ph = best
+    # los máximos del perfil están en v = v0 + k T con v0 = ph T / 2pi
+    v0 = (ph / (2 * math.pi)) * T
+    return T, v0, 2.0 * amp / max(float(prof.std()) * math.sqrt(2.0), 1e-9)
+
+
+def estimate_rows(imgs, mask, pixel_size, period_range_m=(1.0, 8.0)):
+    """
+    Rumbo y distancia entre hileras de UN cuartel, solo con verde. Elige el
+    índice de verdor cuyo patrón sobresale más. Devuelve dict (index, ang
+    [rumbo en coordenadas de imagen, grados], per_px, per_m, v0 [fase,
+    px], ring, amp) en la resolución de trabajo, o None.
+    """
+    pmin, pmax = period_range_m[0] / pixel_size, period_range_m[1] / pixel_size
+    best = None
+    for nm, im in imgs.items():
+        r = _spectrum_peak(im, mask, max(3.0, pmin), pmax)
+        if r is None:
+            continue
+        if best is None or r[2] > best[1][2]:
+            best = (nm, r)
+    if best is None:
+        return None
+    nm, (a0, T0, ring) = best
+    img = imgs[nm]
+    ok = mask & np.isfinite(img)
+    ang = refine_angle(img, ok, a0, T0)
+    T, v0, amp = refine_period(img, ok, ang, T0)
+    return {"index": nm, "ang": ang, "per_px": T, "per_m": T * pixel_size, "v0": v0,
+            "ring": ring, "amp": amp, "ang0": a0, "per0_m": T0 * pixel_size}
