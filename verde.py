@@ -790,7 +790,88 @@ def row_vigor(tile, frame, index, row, half, along=0.3, step=0.1):
     return us, vig
 
 
-def detect_failures(tile, frame, index, rows, T, resid=0.15, thr=0.5, min_len=2.0, search=None):
+def plant_spacing(series, step=0.1, max_lag=6.0, min_peak=0.10):
+    """
+    Distancia entre plantas a lo largo de la hilera: primer máximo de la
+    autocorrelación del vigor (promediada sobre las hileras) entre 0,4 m y
+    max_lag. Con canopia continua no hay máximo claro (< min_peak): devuelve
+    (None, altura). Devuelve (distancia en m o None, altura del pico).
+    """
+    n_l = int(max_lag / step)
+    acc, cnt = np.zeros(n_l + 1), np.zeros(n_l + 1)
+    for v in series:
+        if len(v) < 2 * n_l:
+            continue
+        x = v - np.nanmean(v)
+        f = np.isfinite(x)
+        x = np.where(f, x, 0.0)
+        for L in range(n_l + 1):
+            m = f[:len(x) - L] & f[L:]
+            acc[L] += (x[:len(x) - L] * x[L:])[m].sum()
+            cnt[L] += m.sum()
+    if acc[0] <= 0:
+        return None, 0.0
+    ac = (acc / np.maximum(cnt, 1)) / (acc[0] / max(cnt[0], 1))
+    for i in range(int(0.4 / step), n_l):
+        if ac[i] > ac[i - 1] and ac[i] >= ac[i + 1] and ac[i] >= min_peak:
+            return float(i * step), float(ac[i])
+    return None, float(ac[int(0.4 / step):].max()) if n_l > int(0.4 / step) else 0.0
+
+
+def _running_median(x, k):
+    """Mediana móvil de k muestras que ignora NaN (NaN donde no hay ninguna)."""
+    if k <= 1 or len(x) < k:
+        return x.copy()
+    from numpy.lib.stride_tricks import sliding_window_view
+    pad = np.pad(x, (k // 2, k - 1 - k // 2), mode="edge")
+    w = sliding_window_view(pad, k)
+    out = np.full(len(x), np.nan)
+    okr = np.isfinite(w).sum(axis=1) >= max(1, k // 2)
+    out[okr] = np.nanmedian(w[okr], axis=1)
+    return out
+
+
+def failure_runs(u, z, thr=0.5, hyst=0.0, close_m=1.0, min_len=2.0, step=0.1):
+    """Tramos de falla de una serie de vigor normalizado z(u): regiones contiguas
+    con z < thr + hyst que contienen algún punto con z < thr; se unen los huecos
+    de hasta close_m entre ellas y se queda con las de largo >= min_len."""
+    n = len(z)
+    seed = np.isfinite(z) & (z < thr)
+    grow = np.isfinite(z) & (z < thr + hyst)
+    low = np.zeros(n, bool)
+    i = 0
+    while i < n:
+        if grow[i]:
+            j = i
+            while j + 1 < n and grow[j + 1]:
+                j += 1
+            if seed[i:j + 1].any():
+                low[i:j + 1] = True
+            i = j + 1
+        else:
+            i += 1
+    gap = int(round(close_m / step))
+    idx = np.nonzero(low)[0]
+    for a, b in zip(idx[:-1], idx[1:]):
+        if 1 < b - a <= gap + 1:
+            low[a:b + 1] = True
+    runs, i = [], 0
+    while i < n:
+        if low[i]:
+            j = i
+            while j + 1 < n and low[j + 1]:
+                j += 1
+            ua, ub = u[i] - step / 2, u[j] + step / 2
+            if ub - ua >= min_len:
+                runs.append((float(ua), float(ub), float(np.nanmean(z[i:j + 1]))))
+            i = j + 1
+        else:
+            i += 1
+    return runs
+
+
+def detect_failures(tile, frame, index, rows, T, resid=0.15, thr=0.5, min_len=2.0, search=None,
+                    smooth_m=None, hyst=0.0, close_m=None):
     """
     Fallas de un cuartel con las líneas ajustadas. El buffer es el ancho de la
     franja de vegetación (medido sobre estas líneas) más 'resid' a cada lado.
@@ -806,6 +887,15 @@ def detect_failures(tile, frame, index, rows, T, resid=0.15, thr=0.5, min_len=2.
     for row in rows:
         u, v = row_vigor(tile, frame, index, row, half)
         ser.append((row, u, v))
+    # escala de suavizado y de cierre de huecos: la mitad de la distancia entre plantas
+    # (para que los huecos naturales entre plantas chicas no se junten en una falla), y
+    # 1 m si la hilera es una canopia continua
+    fine = [row_vigor(tile, frame, index, row, half, along=0.15)[1] for row in rows[:: max(1, len(rows) // 25)]
+            if row.u1 - row.u0 >= 20.0]
+    sp_plants, sp_peak = plant_spacing(fine)
+    scale = 1.0 if sp_plants is None else float(np.clip(0.5 * sp_plants, 0.3, 1.0))
+    smooth_m = scale if smooth_m is None else smooth_m
+    close_m = scale if close_m is None else close_m
     allv = np.concatenate([s[2] for s in ser if len(s[2])])
     allv = allv[np.isfinite(allv)]
     ref = float(np.percentile(allv, 75))
@@ -823,23 +913,13 @@ def detect_failures(tile, frame, index, rows, T, resid=0.15, thr=0.5, min_len=2.
     out, fallas = [], []
     for row, u, v in ser:
         z = (v - base) / (ref - base)
-        out.append((row, u, z))
-        low = np.isfinite(z) & (z < thr)
-        i, n = 0, len(u)
-        while i < n:
-            if low[i]:
-                j = i
-                while j + 1 < n and low[j + 1]:
-                    j += 1
-                ua, ub = u[i] - 0.05, u[j] + 0.05
-                if ub - ua >= min_len:
-                    fallas.append({"row": row, "ua": float(ua), "ub": float(ub), "largo": float(ub - ua),
-                                   "z": float(np.nanmean(z[i:j + 1])),
-                                   "borde": int(ua - row.u0 < 2.0 or row.u1 - ub < 2.0)})
-                i = j + 1
-            else:
-                i += 1
+        zs = _running_median(z, max(1, int(round(smooth_m / 0.1))))
+        out.append((row, u, zs))
+        for ua, ub, zm in failure_runs(u, zs, thr, hyst, close_m, min_len):
+            fallas.append({"row": row, "ua": ua, "ub": ub, "largo": ub - ua, "z": zm,
+                           "borde": int(ua - row.u0 < 2.0 or row.u1 - ub < 2.0)})
     return {"half": half, "width": W, "base": base, "ref": ref, "fallas": fallas, "series": out,
+            "plant_spacing": sp_plants, "scale": scale,
             "n_samples": int(sum(np.isfinite(s[2]).sum() for s in ser))}
 
 
