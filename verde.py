@@ -21,6 +21,7 @@ excluyen del muestreo):
 NDVI no hay en un ortomosaico RGB; si el raster tiene una banda infrarroja se
 puede pasar (nir) y se usa NDVI.
 """
+import itertools
 import math
 
 import numpy as np
@@ -433,3 +434,282 @@ def refine_phase(img, ring, ang, per_px, v0, span=0.3):
         if np.isfinite(v).any() and np.nanmean(v) > best[0]:
             best = (float(np.nanmean(v)), float(s))
     return v0 + best[1]
+
+
+# ---------------------------------------------------------------------------
+# Resolución completa: recorte del raster y marco de un cuartel
+# ---------------------------------------------------------------------------
+class Tile:
+    """Recorte del raster en memoria con el índice de verdor de un cuartel."""
+
+    def __init__(self, R, G, B, valid, x0, y0, px, py, nir=None, dark_max=DARK_MAX):
+        self.R, self.G, self.B, self.valid, self.nir = R, G, B, valid, nir
+        self.x0, self.y0, self.px, self.py = x0, y0, px, py
+        self.H, self.W = R.shape
+        self.dark_max = dark_max
+        self._maps = {}
+
+    def index_map(self, name):
+        if name not in self._maps:
+            bright = (self.R.astype(np.float32) + self.G + self.B) / 3.0
+            v = green_index(name, self.R, self.G, self.B, self.nir)
+            self._maps[name] = np.where(self.valid & (bright >= self.dark_max) & np.isfinite(v), v, np.nan).astype(np.float32)
+        return self._maps[name]
+
+    def sample(self, name, x, y):
+        """Valor del índice en (x, y) de mapa (vecino más próximo) y máscara."""
+        m = self.index_map(name)
+        c = np.floor((np.asarray(x) - self.x0) / self.px).astype(np.int64)
+        r = np.floor((self.y0 - np.asarray(y)) / self.py).astype(np.int64)
+        inside = (c >= 0) & (c < self.W) & (r >= 0) & (r < self.H)
+        v = m[np.clip(r, 0, self.H - 1), np.clip(c, 0, self.W - 1)]
+        ok = inside & np.isfinite(v)
+        return v, ok
+
+
+def read_tile(ds, bbox, margin=3.0, bands=(1, 2, 3), nir_band=None, dark_max=DARK_MAX):
+    """Recorta el raster a bbox (xmin, ymin, xmax, ymax en mapa) más un margen."""
+    from osgeo import gdal
+    gt = ds.GetGeoTransform()
+    x0, y0, x1, y1 = bbox[0] - margin, bbox[3] + margin, bbox[2] + margin, bbox[1] - margin
+    c0 = max(0, int((x0 - gt[0]) / gt[1])); c1 = min(ds.RasterXSize, int((x1 - gt[0]) / gt[1]) + 1)
+    r0 = max(0, int((y0 - gt[3]) / gt[5])); r1 = min(ds.RasterYSize, int((y1 - gt[3]) / gt[5]) + 1)
+    if c1 <= c0 or r1 <= r0:
+        return None
+    rd = lambda b: ds.GetRasterBand(b).ReadAsArray(c0, r0, c1 - c0, r1 - r0)
+    R, G, B = (rd(b) for b in bands)
+    valid = np.ones(R.shape, bool)
+    for i in range(1, ds.RasterCount + 1):
+        if ds.GetRasterBand(i).GetColorInterpretation() == gdal.GCI_AlphaBand:
+            valid &= rd(i) > 0
+    nir = rd(nir_band) if nir_band else None
+    return Tile(R, G, B, valid, gt[0] + c0 * gt[1], gt[3] + r0 * gt[5], gt[1], -gt[5], nir, dark_max)
+
+
+class Frame:
+    """Marco (u a lo largo de las hileras, v a través) de un cuartel, en metros de mapa."""
+
+    def __init__(self, origin, u):
+        self.o = np.asarray(origin, float)
+        u = np.asarray(u, float)
+        self.u = u / np.hypot(*u)
+        self.n = np.array([-self.u[1], self.u[0]])
+
+    def to_uv(self, x, y):
+        dx, dy = np.asarray(x) - self.o[0], np.asarray(y) - self.o[1]
+        return dx * self.u[0] + dy * self.u[1], dx * self.n[0] + dy * self.n[1]
+
+    def to_xy(self, u, v):
+        u, v = np.asarray(u), np.asarray(v)
+        return self.o[0] + u * self.u[0] + v * self.n[0], self.o[1] + u * self.u[1] + v * self.n[1]
+
+
+class Row:
+    """Un tramo de hilera: polilínea v(u) en el marco del cuartel."""
+
+    def __init__(self, hilera, u_knots, v_knots):
+        self.hilera = hilera
+        self.uk = np.asarray(u_knots, float)
+        self.vk = np.asarray(v_knots, float)
+
+    @property
+    def u0(self):
+        return float(self.uk[0])
+
+    @property
+    def u1(self):
+        return float(self.uk[-1])
+
+    def v_at(self, u):
+        return np.interp(u, self.uk, self.vk)
+
+
+def rows_from_segments(frame, segments):
+    """segments: [(hilera, x1, y1, x2, y2)] en mapa -> [Row]."""
+    out = []
+    for h, x1, y1, x2, y2 in segments:
+        (ua, ub), (va, vb) = frame.to_uv([x1, x2], [y1, y2])
+        if ua > ub:
+            ua, ub, va, vb = ub, ua, vb, va
+        out.append(Row(h, [ua, ub], [va, vb]))
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Etapa 4: buffer y perfiles transversales; picos de verdor
+# ---------------------------------------------------------------------------
+def lateral_profiles(tile, frame, index, row, half, win_m=2.0, step=None, min_frac=0.5):
+    """
+    Perfiles transversales de verdor dentro del buffer (+-half m) de una
+    hilera, uno por ventana de win_m metros a lo largo de ella. Devuelve
+    (centros u de las ventanas, desplazamientos laterales d, matriz [ventana,
+    d] con el verdor medio, NaN donde faltan datos).
+    """
+    px = float(min(tile.px, tile.py))
+    step = step or px
+    nw = max(1, int(round(win_m / step)))
+    n_win = max(1, int(math.floor((row.u1 - row.u0) / win_m)))
+    u0 = row.u0 + 0.5 * ((row.u1 - row.u0) - n_win * win_m)       # centrar las ventanas
+    us = u0 + (np.arange(n_win * nw) + 0.5) * step
+    d = np.arange(-half, half + 1e-9, px)
+    vv = row.v_at(us)[:, None] + d[None, :]
+    uu = np.broadcast_to(us[:, None], vv.shape)
+    x, y = frame.to_xy(uu, vv)
+    val, ok = tile.sample(index, x.ravel(), y.ravel())
+    val = np.where(ok, val, 0.0).reshape(vv.shape)
+    ok = ok.reshape(vv.shape)
+    cnt = ok.reshape(n_win, nw, -1).sum(1)
+    sm = val.reshape(n_win, nw, -1).sum(1)
+    prof = np.where(cnt >= min_frac * nw, sm / np.maximum(cnt, 1), np.nan)
+    centers = u0 + (np.arange(n_win) + 0.5) * win_m
+    return centers, d, prof
+
+
+def window_peaks(prof, d, px, sigma_m=0.08):
+    """
+    Pico de cada perfil: posición lateral (m), altura y prominencia (altura
+    menos el cuartil inferior del perfil). NaN donde el perfil no tiene datos.
+    """
+    k = max(1, int(round(3 * sigma_m / px)))
+    kern = np.exp(-0.5 * (np.arange(-k, k + 1) * px / sigma_m) ** 2)
+    kern /= kern.sum()
+    n, m = prof.shape
+    pos = np.full(n, np.nan)
+    hgt = np.full(n, np.nan)
+    prm = np.full(n, np.nan)
+    for i in range(n):
+        p = prof[i]
+        f = np.isfinite(p)
+        if f.sum() < 0.7 * m:
+            continue
+        q = np.where(f, p, np.nanmin(p))
+        s = np.convolve(np.pad(q, k, mode="edge"), kern, mode="valid")
+        j = int(np.argmax(s))
+        pos[i], hgt[i], prm[i] = d[j], s[j], s[j] - np.percentile(s, 25)
+    return pos, hgt, prm
+
+
+# ---------------------------------------------------------------------------
+# Etapa 5: líneas con pocos quiebres leves ajustadas a los picos de verde
+# ---------------------------------------------------------------------------
+def fit_polyline(uc, vc, w, n_breaks, kink_max, u_lo, u_hi, cap=0.25):
+    """
+    Poligonal continua con a lo sumo n_breaks quiebres ajustada por mínimos
+    cuadrados (pérdida robusta: un pico aislado que se aparta mucho pesa poco)
+    a los picos (uc, vc) con pesos w. Los quiebres se eligen entre las
+    posiciones de los picos y cada uno cambia la pendiente a lo sumo kink_max
+    (m/m). Prueba 0, 1, ..., n_breaks quiebres y se queda con el menor número
+    cuya pérdida no es más de 10 % peor que la de más quiebres. Devuelve
+    (knots_u, knots_v, n_quiebres, pérdida).
+    """
+    uc, vc, w = (np.asarray(a, float) for a in (uc, vc, w))
+    M = len(uc)
+    um = float(uc.mean())
+    cap2 = cap * cap
+
+    def design(knots, x):
+        return np.array([np.ones(len(x)), np.asarray(x) - um] + [np.maximum(0.0, np.asarray(x) - k) for k in knots]).T
+
+    def solve(knots, wt):
+        X = design(knots, uc)
+        beta = np.linalg.lstsq(X * np.sqrt(wt)[:, None], vc * np.sqrt(wt), rcond=None)[0]
+        return beta, vc - X @ beta
+
+    def loss(res):
+        return float((w * np.minimum(res * res, cap2)).sum())
+
+    def robust(knots):
+        wt = w.copy()
+        for _ in range(3):
+            beta, res = solve(knots, wt)
+            wt = w / (1.0 + (res / 0.12) ** 2)
+        return beta, res
+
+    cands = list(uc[2:-2]) if M > 5 else []
+    if len(cands) > 16:
+        cands = [cands[i] for i in np.unique(np.linspace(0, len(cands) - 1, 16).round().astype(int))]
+    best = {}
+    beta, res = robust([])
+    best[0] = (loss(res), [], beta)
+    chosen = []
+    for n in range(1, n_breaks + 1):
+        combos = (itertools.combinations(cands, n) if n <= 3
+                  else ([c for c in chosen] + [k] for k in cands if k not in chosen))
+        bn = None
+        for kn in combos:
+            kn = sorted(kn)
+            beta, res = solve(kn, w)
+            if any(abs(c) > kink_max + 1e-9 for c in beta[2:]):
+                continue
+            L = loss(res)
+            if bn is None or L < bn[0]:
+                bn = (L, kn)
+        if bn is None:
+            break
+        chosen = list(bn[1])
+        beta, res = robust(chosen)
+        if all(abs(c) <= kink_max + 1e-9 for c in beta[2:]):
+            best[n] = (loss(res), chosen, beta)
+    # menor número de quiebres que no pierda más de 10 % contra el mejor
+    Lmin = min(b[0] for b in best.values())
+    n_sel = min(n for n, b in best.items() if b[0] <= 1.10 * Lmin + 1e-12)
+    L, knots, beta = best[n_sel]
+    ku = np.array([u_lo] + [k for k in knots if u_lo < k < u_hi] + [u_hi])
+    kv = design(knots, ku) @ beta
+    return ku, kv, len(knots), L
+
+
+def adjust_row(tile, frame, index, row, half, win_m=2.0, n_breaks=3, kink_deg=3.0, n_iter=3,
+               max_shift=0.9, prom_ref=None, min_gain=0.15):
+    """
+    Ajusta una hilera: buffer alrededor de su línea -> picos de verdor en los
+    perfiles transversales -> línea con pocos quiebres que los ajusta -> nuevo
+    buffer alrededor de ella, hasta que converja. Verifica con validación
+    cruzada (se ajusta con las ventanas pares y se mide con las impares) que la
+    línea nueva queda más cerca de los picos que la inicial; si no, deja la
+    inicial. Devuelve (Row nueva, dict con el detalle).
+    """
+    px = float(min(tile.px, tile.py))
+    kink_max = math.tan(math.radians(kink_deg))
+    cur = Row(row.hilera, row.uk.copy(), row.vk.copy())
+    info = {"n_win": 0, "n_pico": 0, "iter": 0, "quiebres": 0, "aceptada": False,
+            "dev_ini": np.nan, "dev_nueva": np.nan, "cv_ini": np.nan, "cv_nueva": np.nan}
+    first = None
+    for it in range(n_iter):
+        cen, d, prof = lateral_profiles(tile, frame, index, cur, half, win_m)
+        pos, hgt, prm = window_peaks(prof, d, px)
+        ref = prom_ref if prom_ref is not None else np.nanpercentile(prm, 75) if np.isfinite(prm).any() else np.nan
+        clear = np.isfinite(pos) & (prm >= 0.35 * ref)
+        if clear.sum() < 6:
+            break
+        vpk = cur.v_at(cen) + pos                          # posición lateral absoluta del pico
+        if first is None:
+            first = (cen[clear], vpk[clear], pos[clear], prm[clear] / ref)
+            info["n_win"], info["n_pico"] = len(cen), int(clear.sum())
+        w = np.clip(prm[clear] / ref, 0.2, 1.0)
+        uc, vc = cen[clear], vpk[clear]
+        # tope: no alejarse de la línea inicial más de max_shift
+        v_init = row.v_at(uc)
+        vc = np.clip(vc, v_init - max_shift, v_init + max_shift)
+        ku, kv, nb, _ = fit_polyline(uc, vc, w, n_breaks, kink_max, row.u0, row.u1)
+        new = Row(row.hilera, ku, kv)
+        change = float(np.max(np.abs(new.v_at(cen) - cur.v_at(cen))))
+        cur = new
+        info["iter"], info["quiebres"] = it + 1, nb
+        if change < 0.03:
+            break
+    if first is None:
+        return row, info
+    # validación cruzada con los picos de la primera pasada (alrededor de la línea inicial)
+    uc0, vc0, d0, w0 = first
+    ev, od = np.arange(len(uc0)) % 2 == 0, np.arange(len(uc0)) % 2 == 1
+    if ev.sum() >= 4 and od.sum() >= 4:
+        ku2, kv2, _, _ = fit_polyline(uc0[ev], vc0[ev], np.clip(w0[ev], 0.2, 1), n_breaks, kink_max, row.u0, row.u1)
+        cv_new = float(np.median(np.abs(vc0[od] - np.interp(uc0[od], ku2, kv2))))
+        cv_ini = float(np.median(np.abs(vc0[od] - row.v_at(uc0[od]))))
+        info["cv_ini"], info["cv_nueva"] = cv_ini, cv_new
+        info["aceptada"] = bool(cv_new <= (1.0 - min_gain) * cv_ini)
+    info["peaks"] = (uc0, vc0, d0)
+    info["dev_ini"] = float(np.median(np.abs(d0)))
+    info["dev_nueva"] = float(np.median(np.abs(vc0 - cur.v_at(uc0))))
+    return (cur if info["aceptada"] else row), info
