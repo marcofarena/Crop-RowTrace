@@ -21,13 +21,19 @@ El índice de verdor lo elige solo, por cuartel, entre ExG, VARI, GLI y NGRDI. S
 | macOS | `/Applications/QGIS.app/Contents/MacOS/bin/python3 -m pip install opencv-python-headless==4.11.0.86` |
 | Linux | `python3 -m pip install --user opencv-python-headless==4.11.0.86` |
 
-**2. Copiar el plugin.** Tiene que quedar en una carpeta llamada `crop_row_detector` (la que contiene `metadata.txt`) dentro de la carpeta de plugins de tu perfil de QGIS:
+**2. Copiar el plugin** dentro de la carpeta de plugins de tu perfil de QGIS. La carpeta del plugin es la que contiene `metadata.txt`; el nombre de la carpeta da igual.
 
 - Windows: `%APPDATA%\QGIS\QGIS3\profiles\default\python\plugins\`
 - macOS: `~/Library/Application Support/QGIS/QGIS3/profiles/default/python/plugins/`
 - Linux: `~/.local/share/QGIS/QGIS3/profiles/default/python/plugins/`
 
-Por ejemplo: `git clone <URL del repositorio> crop_row_detector` dentro de esa carpeta, o descargar el ZIP del repositorio, descomprimirlo y renombrar la carpeta.
+Lo más simple es abrir una terminal en esa carpeta y correr:
+
+```
+git clone https://github.com/marcofarena/Crop-RowTrace.git
+```
+
+O bien descargar el ZIP desde GitHub (`Code > Download ZIP`), descomprimirlo y copiar la carpeta resultante ahí.
 
 **3. Activarlo.** Reiniciá QGIS y en `Complementos > Administrar e instalar complementos` buscá **Detección de Hileras de Cultivo** y marcalo.
 
