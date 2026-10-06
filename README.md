@@ -3,6 +3,76 @@
 Algoritmo de **Processing** para QGIS que detecta hileras de cultivo en un
 ortomosaico RGB (drone o satélite) sin necesidad de entrenar ningún modelo.
 
+## Hileras y fallas por cuartel (basado en verde) — v0.21
+
+Algoritmo **"Hileras y fallas por cuartel (basado en verde)"**. Parte de un
+ortomosaico y entrega los cuarteles, las hileras ajustadas a las plantas y las
+fallas (tramos de hilera sin planta). Todo se basa en el verdor; la sombra no
+se usa para detectar nada (solo se excluyen del muestreo los píxeles de brillo
+< 30, donde el cociente entre bandas es ruido). El código está en `verde.py`.
+
+No hay NDVI en un ortomosaico RGB: el índice se elige por cuartel entre ExG,
+VARI, GLI y NGRDI (el que más marca el patrón). Con una banda infrarroja
+(parámetro opcional) se usa NDVI.
+
+### Proceso
+
+1. **Delimitación de cuarteles.** Zonas con un patrón periódico de hileras (el
+   verdor sin patrón, como monte o pasto, no es cuartel; las calles separan
+   cuarteles). Por defecto usa el patrón en verde y en brillo (`bloques.py`),
+   que da contornos más limpios; "solo verde" queda como opción.
+2. **Rumbo y distancia entre hileras de cada cuartel**, por separado: espectro
+   dentro del polígono, rumbo afinado por el máximo contraste del perfil
+   perpendicular y período por periodograma fino.
+3. **Líneas iniciales:** una recta por hilera, paralelas, recortadas al
+   polígono.
+4. **Primer buffer** (semiancho 0,35 de la distancia entre hileras) y
+   **perfiles transversales de verdor** cada 2 m a lo largo de la hilera: el
+   pico de cada perfil dice dónde está la planta.
+5. **Líneas ajustadas:** con un máximo de N quiebres leves (3 por defecto, de a
+   lo sumo 3° cada uno), por mínimos cuadrados robustos a esos picos; se repite
+   alrededor de la línea nueva hasta converger. Una línea nueva solo se acepta
+   si, medida con las ventanas que no se usaron para ajustar (validación
+   cruzada), queda al menos 15 % más cerca de los picos que la inicial.
+6. **Segundo buffer** alrededor de las líneas ajustadas (ancho de la franja de
+   vegetación medido sobre ellas, más un margen de 0,15 m): es el que decide
+   las fallas. El verdor del buffer se normaliza entre la entrehilera (0) y una
+   planta típica del cuartel (1, percentil 75). **Falla** = tramo continuo con
+   valor < 0,5 y de al menos 2 m. El vigor se suaviza con una mediana y se unen
+   los huecos cortos, con una escala igual a la mitad de la distancia entre
+   plantas (autocorrelación a lo largo de la hilera; 1 m si la canopia es
+   continua), para que los huecos naturales entre plantas chicas no se junten.
+
+### Salidas
+
+| Salida | Contenido |
+|---|---|
+| Cuarteles | polígono, rumbo, distancia, índice, distancia entre plantas, buffer, % de fallas (con y sin borde) |
+| Hileras ajustadas | línea de cada hilera; `ajustada` (0/1), `quiebres`, desvío al pico antes y después (validación cruzada) |
+| Fallas | tramo, largo, vigor y `borde` |
+| Buffer final, hileras iniciales, picos (opcionales) | para revisar cada etapa |
+
+Las **fallas de borde** (a menos de 2 m del extremo de la hilera) se marcan
+aparte: dependen de cuánto se pasa el polígono del cuartel de la última planta,
+y en una cabecera son suelo desnudo. Los porcentajes "sin borde" son los más
+confiables.
+
+### Qué se midió y qué no
+
+En el ortomosaico de prueba (~13 ha de viñedo, 6 cuarteles) el desvío mediano
+de las líneas al pico de verdor, con validación cruzada, bajó de 0,06-0,16 m a
+0,03-0,05 m. Las fallas dieron entre 5 y 17 % del largo de hileras según el
+cuartel (entre 3,8 y 12 % sin las de borde); en el cuartel de plantas chicas
+(13 %) los tramos que se miraron en la imagen eran huecos reales. **No hay plantas contadas a mano**: el umbral de falla (0,5), el
+largo mínimo (2 m) y el margen del buffer son criterios, no valores calibrados,
+y los porcentajes dependen de ellos. Tampoco se probó en otros cultivos.
+El raster tiene que estar en un CRS proyectado (metros).
+
+Los otros algoritmos del plugin siguen disponibles: "Detectar hileras de
+cultivo" (el original, descrito abajo), "Inferir cuarteles a partir de las
+hileras" y "Perfil de vegetación y fallas por hilera" (una versión anterior
+del análisis de fallas, que usaba también el brillo).
+
 ## Cómo funciona
 
 Pasos comunes a los dos métodos:
@@ -1295,6 +1365,18 @@ uno por hilera.
   (b) la tolerancia de un lado en todos los lotes: mejoraba el viñedo
   con rastra y la parcela 500 pero empeoraba el frutal joven, un frutal a
   7 m y un viñedo (líneas en un callejón pelado).
+
+- **0.20**: **detección automática de cuarteles** en "Detectar hileras de
+  cultivo" (parámetro nuevo, por defecto activado, que solo actúa sin capa
+  de contorno): primero se buscan en la imagen las zonas con patrón de
+  hileras y cada cuartel estima su propio rumbo y su propia separación.
+  Capa opcional de cuarteles. Algoritmos nuevos: "Inferir cuarteles a partir
+  de las hileras" y "Perfil de vegetación y fallas por hilera".
+- **0.21**: algoritmo nuevo **"Hileras y fallas por cuartel (basado en
+  verde)"** (ver la sección al principio de este README). Sin criterio de
+  sombra; líneas con pocos quiebres leves ajustadas a los picos de verdor
+  con validación cruzada; fallas detectadas en un segundo buffer alrededor
+  de las líneas ajustadas.
 
 ## Referencias
 

@@ -6,6 +6,7 @@ import os
 from .algorithm import DetectCropRowsAlgorithm
 from .algorithm_cuarteles import InferBlocksAlgorithm
 from .algorithm_perfil import RowProfileAlgorithm
+from .algorithm_verde import HilerasFallasVerdeAlgorithm
 
 
 class CropRowProvider(QgsProcessingProvider):
@@ -26,3 +27,4 @@ class CropRowProvider(QgsProcessingProvider):
         self.addAlgorithm(DetectCropRowsAlgorithm())
         self.addAlgorithm(InferBlocksAlgorithm())
         self.addAlgorithm(RowProfileAlgorithm())
+        self.addAlgorithm(HilerasFallasVerdeAlgorithm())

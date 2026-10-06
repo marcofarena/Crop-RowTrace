@@ -928,7 +928,7 @@ def detect_failures(tile, frame, index, rows, T, resid=0.15, thr=0.5, min_len=2.
 # ---------------------------------------------------------------------------
 # Proceso completo
 # ---------------------------------------------------------------------------
-def previous_blocks(ds, work_px=0.2, log=print):
+def previous_blocks(ds, work_px=0.2, log=print, bands=(1, 2, 3)):
     """Cuarteles con el método de bloques.py (patrón de hileras en el verdor y en
     el brillo, a resolución de trabajo), ordenados de norte a sur. Devuelve
     [{ring (px de la imagen de trabajo), area_ha, ang, per_m, ratio}]."""
@@ -940,9 +940,9 @@ def previous_blocks(ds, work_px=0.2, log=print):
     spec.loader.exec_module(bq)
     gt = ds.GetGeoTransform()
     f = max(1, int(round(work_px / abs(gt[1]))))
-    r, g, b = (ds.GetRasterBand(i).ReadAsArray().astype(np.float32) for i in (1, 2, 3))
+    r, g, b = (ds.GetRasterBand(i).ReadAsArray().astype(np.float32) for i in bands)
     valid = np.ones(r.shape, bool)
-    for i in (1, 2, 3):
+    for i in bands:
         valid &= ds.GetRasterBand(i).GetMaskBand().ReadAsArray() > 0
     rs, gs, bs = (cv2.GaussianBlur(x, (0, 0), 1.0) for x in (r, g, b))
     tot = rs + gs + bs
@@ -960,7 +960,8 @@ def previous_blocks(ds, work_px=0.2, log=print):
 
 
 def run_all(ds, nir_band=None, only=None, work_px=0.2, n_breaks=3, kink_deg=3.0, win_m=2.0,
-            search_frac=0.35, thr=0.5, min_len=2.0, resid=0.15, log=print, blocks=None, delimitacion="previa"):
+            search_frac=0.35, thr=0.5, min_len=2.0, resid=0.15, log=print, blocks=None, delimitacion="previa",
+            bands=(1, 2, 3), progress=None):
     """
     Corre las seis etapas sobre un raster abierto con GDAL (RGB en las bandas
     1-3; con nir_band se usa NDVI). only: lista de números de cuartel (de norte
@@ -976,7 +977,7 @@ def run_all(ds, nir_band=None, only=None, work_px=0.2, n_breaks=3, kink_deg=3.0,
     w, h = ds.RasterXSize // f, ds.RasterYSize // f
     rd = lambda b: ds.GetRasterBand(b).ReadAsArray(buf_xsize=w, buf_ysize=h,
                                                    resample_alg=gdal.GRIORA_Average).astype(np.float32)
-    R, G, B = rd(1), rd(2), rd(3)
+    R, G, B = (rd(b) for b in bands)
     valid = np.ones(R.shape, bool)
     for i in range(1, ds.RasterCount + 1):
         if ds.GetRasterBand(i).GetColorInterpretation() == gdal.GCI_AlphaBand:
@@ -986,7 +987,7 @@ def run_all(ds, nir_band=None, only=None, work_px=0.2, n_breaks=3, kink_deg=3.0,
     px2map = lambda x, y: (gt[0] + x * f * gt[1], gt[3] + y * f * gt[5])
     log("Etapa 1: delimitación de cuarteles (%s)" % delimitacion)
     if blocks is None:
-        blocks = previous_blocks(ds, work_px, log) if delimitacion == "previa" else detect_blocks(imgs, valid, wpx)
+        blocks = previous_blocks(ds, work_px, log, bands) if delimitacion == "previa" else detect_blocks(imgs, valid, wpx)
     out = []
     for c, b in enumerate(blocks, 1):
         if only and c not in only:
@@ -1007,7 +1008,7 @@ def run_all(ds, nir_band=None, only=None, work_px=0.2, n_breaks=3, kink_deg=3.0,
                       (segs[0][3] - segs[0][1], segs[0][4] - segs[0][2]))
         rows0 = rows_from_segments(frame, segs)
         tile = read_tile(ds, (bb.xMinimum(), bb.yMinimum(), bb.xMaximum(), bb.yMaximum()),
-                         nir_band=nir_band)
+                         bands=bands, nir_band=nir_band)
         T, idx = est["per_m"], est["index"]
         half = search_frac * T
         prm = []                                                                # etapa 4
@@ -1022,11 +1023,13 @@ def run_all(ds, nir_band=None, only=None, work_px=0.2, n_breaks=3, kink_deg=3.0,
             infos.append(inf)
         rows_ok = [r for r in rows if r.u1 - r.u0 >= 4.0]                       # etapa 6
         fl = detect_failures(tile, frame, idx, rows_ok, T, resid, thr, min_len)
-        out.append({"cuartel": c, "ring": b["ring"], "area_ha": b["area_ha"], "est": est, "frame": frame,
+        out.append({"cuartel": c, "px_factor": f, "ring": b["ring"], "area_ha": b["area_ha"], "est": est, "frame": frame,
                     "rows_ini": rows0, "rows": rows, "infos": infos, "rows_final": rows_ok,
                     "buffer": fl["half"] if fl else None, "fallas": fl["fallas"] if fl else [],
                     "ancho": fl["width"] if fl else None, "base": fl["base"] if fl else None,
                     "ref": fl["ref"] if fl else None, "n_samples": fl["n_samples"] if fl else 0,
                     "escala": fl["scale"] if fl else None, "dist_plantas": fl["plant_spacing"] if fl else None})
         log("  %d hileras, %d fallas" % (len(rows_ok), len(out[-1]["fallas"])))
+        if progress:
+            progress(c, len(blocks))
     return out
