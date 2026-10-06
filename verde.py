@@ -6,8 +6,10 @@ Proceso (cada etapa usa solo un índice de verdor; la sombra no se usa para
 detectar nada, y los píxeles tan oscuros que el índice es puro ruido se
 excluyen del muestreo):
 
-  1. Delimitación de cuarteles: zonas con un patrón periódico de hileras en el
-     índice de verdor (el verdor sin patrón, como monte o pasto, no es cuartel).
+  1. Delimitación de cuarteles: zonas con un patrón periódico de hileras (el
+     verdor sin patrón, como monte o pasto, no es cuartel). Por defecto se usa el
+     método de bloques.py (patrón en el verdor y en el brillo), que da contornos
+     más limpios que detect_blocks, el equivalente solo con verde.
   2. Rumbo y distancia entre hileras de cada cuartel, por separado.
   3. Líneas iniciales: una recta por hilera, paralelas, con ese rumbo y esa
      distancia.
@@ -926,8 +928,39 @@ def detect_failures(tile, frame, index, rows, T, resid=0.15, thr=0.5, min_len=2.
 # ---------------------------------------------------------------------------
 # Proceso completo
 # ---------------------------------------------------------------------------
+def previous_blocks(ds, work_px=0.2, log=print):
+    """Cuarteles con el método de bloques.py (patrón de hileras en el verdor y en
+    el brillo, a resolución de trabajo), ordenados de norte a sur. Devuelve
+    [{ring (px de la imagen de trabajo), area_ha, ang, per_m, ratio}]."""
+    import cv2
+    import importlib.util
+    import os
+    spec = importlib.util.spec_from_file_location("bloques", os.path.join(os.path.dirname(os.path.abspath(__file__)), "bloques.py"))
+    bq = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(bq)
+    gt = ds.GetGeoTransform()
+    f = max(1, int(round(work_px / abs(gt[1]))))
+    r, g, b = (ds.GetRasterBand(i).ReadAsArray().astype(np.float32) for i in (1, 2, 3))
+    valid = np.ones(r.shape, bool)
+    for i in (1, 2, 3):
+        valid &= ds.GetRasterBand(i).GetMaskBand().ReadAsArray() > 0
+    rs, gs, bs = (cv2.GaussianBlur(x, (0, 0), 1.0) for x in (r, g, b))
+    tot = rs + gs + bs
+    exg = (2 * gs - rs - bs) / np.maximum(tot, 1e-6)
+    exg[(tot <= 0) | ~valid] = 0.0
+    bri = (r + g + b) / 3.0
+    bri[~valid] = 0.0
+    del r, g, b, rs, gs, bs, tot
+    blocks = bq.detect_blocks(exg, bri, valid, abs(gt[1]), work_px=work_px)
+    out = [{"ring": [(x / f, y / f) for x, y in bk["rings"][0]], "area_ha": bk["area_ha"], "ang": bk["ang"],
+            "per_m": bk["per_m"], "ratio": bk["ratio"]} for bk in blocks]
+    out.sort(key=lambda bk: (round(float(np.mean([p[1] for p in bk["ring"]])) * abs(gt[1]) * f / 50.0),
+                             float(np.mean([p[0] for p in bk["ring"]]))))
+    return out
+
+
 def run_all(ds, nir_band=None, only=None, work_px=0.2, n_breaks=3, kink_deg=3.0, win_m=2.0,
-            search_frac=0.35, thr=0.5, min_len=2.0, resid=0.15, log=print):
+            search_frac=0.35, thr=0.5, min_len=2.0, resid=0.15, log=print, blocks=None, delimitacion="previa"):
     """
     Corre las seis etapas sobre un raster abierto con GDAL (RGB en las bandas
     1-3; con nir_band se usa NDVI). only: lista de números de cuartel (de norte
@@ -951,8 +984,9 @@ def run_all(ds, nir_band=None, only=None, work_px=0.2, n_breaks=3, kink_deg=3.0,
     imgs = index_images(R, G, B, valid, nir=rd(nir_band) if nir_band else None)
     wpx = abs(gt[1]) * f
     px2map = lambda x, y: (gt[0] + x * f * gt[1], gt[3] + y * f * gt[5])
-    log("Etapa 1: delimitación de cuarteles")
-    blocks = detect_blocks(imgs, valid, wpx)
+    log("Etapa 1: delimitación de cuarteles (%s)" % delimitacion)
+    if blocks is None:
+        blocks = previous_blocks(ds, work_px, log) if delimitacion == "previa" else detect_blocks(imgs, valid, wpx)
     out = []
     for c, b in enumerate(blocks, 1):
         if only and c not in only:
@@ -992,6 +1026,7 @@ def run_all(ds, nir_band=None, only=None, work_px=0.2, n_breaks=3, kink_deg=3.0,
                     "rows_ini": rows0, "rows": rows, "infos": infos, "rows_final": rows_ok,
                     "buffer": fl["half"] if fl else None, "fallas": fl["fallas"] if fl else [],
                     "ancho": fl["width"] if fl else None, "base": fl["base"] if fl else None,
-                    "ref": fl["ref"] if fl else None, "n_samples": fl["n_samples"] if fl else 0})
+                    "ref": fl["ref"] if fl else None, "n_samples": fl["n_samples"] if fl else 0,
+                    "escala": fl["scale"] if fl else None, "dist_plantas": fl["plant_spacing"] if fl else None})
         log("  %d hileras, %d fallas" % (len(rows_ok), len(out[-1]["fallas"])))
     return out
