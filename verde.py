@@ -713,3 +713,205 @@ def adjust_row(tile, frame, index, row, half, win_m=2.0, n_breaks=3, kink_deg=3.
     info["dev_ini"] = float(np.median(np.abs(d0)))
     info["dev_nueva"] = float(np.median(np.abs(vc0 - cur.v_at(uc0))))
     return (cur if info["aceptada"] else row), info
+
+
+# ---------------------------------------------------------------------------
+# Etapa 6: segundo buffer (alrededor de las líneas ajustadas) y fallas
+# ---------------------------------------------------------------------------
+def _sample_along(tile, frame, index, row, d, step):
+    """Verdor de la hilera en una grilla (u a lo largo cada 'step' m, d lateral):
+    devuelve (u, matriz [u, d] con NaN donde no hay dato)."""
+    us = np.arange(row.u0 + step / 2.0, row.u1, step)
+    if len(us) < 2:
+        return us, np.full((len(us), len(d)), np.nan)
+    vv = row.v_at(us)[:, None] + d[None, :]
+    uu = np.broadcast_to(us[:, None], vv.shape)
+    x, y = frame.to_xy(uu, vv)
+    val, ok = tile.sample(index, x.ravel(), y.ravel())
+    return us, np.where(ok, val, np.nan).reshape(vv.shape)
+
+
+def vegetation_profile(tile, frame, index, rows, search, max_rows=60):
+    """Perfil transversal medio de verdor medido sobre las líneas AJUSTADAS
+    (+-search m): (d, perfil suavizado, ancho al 60 % de la altura, nivel de
+    entrehilera, altura del pico)."""
+    px = float(min(tile.px, tile.py))
+    d = np.arange(-search, search + 1e-9, px)
+    acc = np.zeros(len(d)); cnt = np.zeros(len(d))
+    for row in rows[:: max(1, len(rows) // max_rows)]:
+        us, M = _sample_along(tile, frame, index, row, d, 0.25)
+        f = np.isfinite(M)
+        acc += np.where(f, M, 0.0).sum(0); cnt += f.sum(0)
+    P = acc / np.maximum(cnt, 1)
+    P[cnt < 30] = np.nan
+    k = max(1, int(round(0.1 / px)))
+    Ps = np.convolve(np.pad(np.nan_to_num(P, nan=np.nanmin(P)), k, mode="edge"), np.ones(2 * k + 1) / (2 * k + 1), mode="valid")
+    j = int(np.argmax(Ps))
+    base = float(np.percentile(Ps, 20))
+    thr = base + 0.6 * (Ps[j] - base)
+    a = b = j
+    while a > 0 and Ps[a - 1] >= thr:
+        a -= 1
+    while b < len(Ps) - 1 and Ps[b + 1] >= thr:
+        b += 1
+    return d, Ps, float(d[b] - d[a] + px), base, float(Ps[j])
+
+
+def row_vigor(tile, frame, index, row, half, along=0.3, step=0.1):
+    """Verdor de la franja medido dentro del buffer (+-half m) de una hilera
+    ajustada: en cada punto, el pico (suavizado 0,16 m) del perfil lateral
+    promediado 'along' metros a lo largo de la hilera. Devuelve (u, vigor)."""
+    px = float(min(tile.px, tile.py))
+    d = np.arange(-half, half + 1e-9, px)
+    us, M = _sample_along(tile, frame, index, row, d, step)
+    if len(us) < 2:
+        return us, np.full(len(us), np.nan)
+    f = np.isfinite(M)
+    k = max(1, int(round(along / step)))
+    z = np.zeros((1, M.shape[1]))
+    cs = np.concatenate([z, np.cumsum(np.where(f, M, 0.0), axis=0)])
+    cc = np.concatenate([z, np.cumsum(f, axis=0)])
+    n = len(us)
+    lo = np.clip(np.arange(n) - k // 2, 0, n)
+    hi = np.clip(np.arange(n) + k // 2 + 1, 0, n)
+    sm = (cs[hi] - cs[lo]) / np.maximum(cc[hi] - cc[lo], 1)
+    sm = np.where((cc[hi] - cc[lo]) >= 0.5 * (hi - lo)[:, None], sm, np.nan)
+    kl = max(1, int(round(0.08 / px)))                       # suavizado lateral (vectorizado)
+    fin = np.isfinite(sm)
+    rowmin = np.where(fin.any(axis=1), np.nanmin(np.where(fin, sm, np.inf), axis=1), 0.0)
+    fill = np.where(fin, sm, rowmin[:, None])
+    pad = np.pad(fill, ((0, 0), (kl, kl)), mode="edge")
+    cs2 = np.concatenate([np.zeros((pad.shape[0], 1)), np.cumsum(pad, axis=1)], axis=1)
+    sl = (cs2[:, 2 * kl + 1:] - cs2[:, :-(2 * kl + 1)]) / (2 * kl + 1)
+    sl = np.where((fin.sum(axis=1) > 0.7 * fin.shape[1])[:, None], sl, np.nan)
+    vig = np.full(len(us), np.nan)
+    ok_rows = np.isfinite(sl).any(axis=1)
+    vig[ok_rows] = np.nanmax(sl[ok_rows], axis=1)
+    return us, vig
+
+
+def detect_failures(tile, frame, index, rows, T, resid=0.15, thr=0.5, min_len=2.0, search=None):
+    """
+    Fallas de un cuartel con las líneas ajustadas. El buffer es el ancho de la
+    franja de vegetación (medido sobre estas líneas) más 'resid' a cada lado.
+    El verdor del buffer se normaliza entre el nivel de la entrehilera (0) y el
+    de una planta típica del cuartel (1, percentil 75); falla = tramo continuo
+    con valor < thr y largo >= min_len.
+    Devuelve dict: half, width, base, ref, fallas [dict], rows [(Row, u, z)].
+    """
+    search = search or 0.35 * T
+    d, Ps, W, base_prof, peak = vegetation_profile(tile, frame, index, rows, search)
+    half = float(min(max(W / 2.0 + resid, 0.25), 0.6))
+    ser = []
+    for row in rows:
+        u, v = row_vigor(tile, frame, index, row, half)
+        ser.append((row, u, v))
+    allv = np.concatenate([s[2] for s in ser if len(s[2])])
+    allv = allv[np.isfinite(allv)]
+    ref = float(np.percentile(allv, 75))
+    # nivel de entrehilera: verdor medio a media separación entre dos hileras
+    mid = []
+    for row in rows[:: max(1, len(rows) // 40)]:
+        for sgn in (-1, 1):
+            r2 = Row(row.hilera, row.uk, row.vk + sgn * 0.5 * T)
+            _, M = _sample_along(tile, frame, index, r2, np.array([0.0]), 0.5)
+            mid.append(M[:, 0])
+    mid = np.concatenate(mid)
+    base = float(np.nanmedian(mid[np.isfinite(mid)]))
+    if ref - base < 1e-6:
+        return None
+    out, fallas = [], []
+    for row, u, v in ser:
+        z = (v - base) / (ref - base)
+        out.append((row, u, z))
+        low = np.isfinite(z) & (z < thr)
+        i, n = 0, len(u)
+        while i < n:
+            if low[i]:
+                j = i
+                while j + 1 < n and low[j + 1]:
+                    j += 1
+                ua, ub = u[i] - 0.05, u[j] + 0.05
+                if ub - ua >= min_len:
+                    fallas.append({"row": row, "ua": float(ua), "ub": float(ub), "largo": float(ub - ua),
+                                   "z": float(np.nanmean(z[i:j + 1])),
+                                   "borde": int(ua - row.u0 < 2.0 or row.u1 - ub < 2.0)})
+                i = j + 1
+            else:
+                i += 1
+    return {"half": half, "width": W, "base": base, "ref": ref, "fallas": fallas, "series": out,
+            "n_samples": int(sum(np.isfinite(s[2]).sum() for s in ser))}
+
+
+# ---------------------------------------------------------------------------
+# Proceso completo
+# ---------------------------------------------------------------------------
+def run_all(ds, nir_band=None, only=None, work_px=0.2, n_breaks=3, kink_deg=3.0, win_m=2.0,
+            search_frac=0.35, thr=0.5, min_len=2.0, resid=0.15, log=print):
+    """
+    Corre las seis etapas sobre un raster abierto con GDAL (RGB en las bandas
+    1-3; con nir_band se usa NDVI). only: lista de números de cuartel (de norte
+    a sur, desde 1) para correr solo esos. Devuelve una lista de dicts, uno por
+    cuartel: ring (px de la imagen de trabajo), est (rumbo, distancia, índice),
+    frame, rows_ini, rows (ajustadas), info (por hilera), buffer (mitad del
+    ancho, m), fallas, base, ref.
+    """
+    from osgeo import gdal
+    from qgis.core import QgsGeometry, QgsPointXY
+    gt = ds.GetGeoTransform()
+    f = max(1, int(round(work_px / abs(gt[1]))))
+    w, h = ds.RasterXSize // f, ds.RasterYSize // f
+    rd = lambda b: ds.GetRasterBand(b).ReadAsArray(buf_xsize=w, buf_ysize=h,
+                                                   resample_alg=gdal.GRIORA_Average).astype(np.float32)
+    R, G, B = rd(1), rd(2), rd(3)
+    valid = np.ones(R.shape, bool)
+    for i in range(1, ds.RasterCount + 1):
+        if ds.GetRasterBand(i).GetColorInterpretation() == gdal.GCI_AlphaBand:
+            valid &= rd(i) > 200
+    imgs = index_images(R, G, B, valid, nir=rd(nir_band) if nir_band else None)
+    wpx = abs(gt[1]) * f
+    px2map = lambda x, y: (gt[0] + x * f * gt[1], gt[3] + y * f * gt[5])
+    log("Etapa 1: delimitación de cuarteles")
+    blocks = detect_blocks(imgs, valid, wpx)
+    out = []
+    for c, b in enumerate(blocks, 1):
+        if only and c not in only:
+            continue
+        log("Cuartel %d (%.2f ha)" % (c, b["area_ha"]))
+        mask = rasterize(b["ring"], valid.shape) & valid
+        est = estimate_rows(imgs, mask, wpx)                                   # etapa 2
+        est["v0"] = refine_phase(imgs[est["index"]], b["ring"], est["ang"], est["per_px"], est["v0"])
+        rows_px = initial_rows(b["ring"], est["ang"], est["per_px"], est["v0"])   # etapa 3
+        segs = []
+        for k, ss in rows_px:
+            for (x1, y1, x2, y2) in ss:
+                (ax, ay), (bx, by) = px2map(x1, y1), px2map(x2, y2)
+                segs.append((k, ax, ay, bx, by))
+        poly = QgsGeometry.fromPolygonXY([[QgsPointXY(*px2map(x, y)) for x, y in b["ring"]]])
+        bb = poly.boundingBox()
+        frame = Frame(((segs[0][1] + segs[0][3]) / 2, (segs[0][2] + segs[0][4]) / 2),
+                      (segs[0][3] - segs[0][1], segs[0][4] - segs[0][2]))
+        rows0 = rows_from_segments(frame, segs)
+        tile = read_tile(ds, (bb.xMinimum(), bb.yMinimum(), bb.xMaximum(), bb.yMaximum()),
+                         nir_band=nir_band)
+        T, idx = est["per_m"], est["index"]
+        half = search_frac * T
+        prm = []                                                                # etapa 4
+        for row in rows0:
+            cen, d, prof = lateral_profiles(tile, frame, idx, row, half, win_m)
+            prm += list(window_peaks(prof, d, tile.px)[2])
+        ref_prm = float(np.nanpercentile(prm, 75))
+        rows, infos = [], []                                                    # etapa 5
+        for row in rows0:
+            nr, inf = adjust_row(tile, frame, idx, row, half, win_m, n_breaks, kink_deg, prom_ref=ref_prm)
+            rows.append(nr)
+            infos.append(inf)
+        rows_ok = [r for r in rows if r.u1 - r.u0 >= 4.0]                       # etapa 6
+        fl = detect_failures(tile, frame, idx, rows_ok, T, resid, thr, min_len)
+        out.append({"cuartel": c, "ring": b["ring"], "area_ha": b["area_ha"], "est": est, "frame": frame,
+                    "rows_ini": rows0, "rows": rows, "infos": infos, "rows_final": rows_ok,
+                    "buffer": fl["half"] if fl else None, "fallas": fl["fallas"] if fl else [],
+                    "ancho": fl["width"] if fl else None, "base": fl["base"] if fl else None,
+                    "ref": fl["ref"] if fl else None, "n_samples": fl["n_samples"] if fl else 0})
+        log("  %d hileras, %d fallas" % (len(rows_ok), len(out[-1]["fallas"])))
+    return out
