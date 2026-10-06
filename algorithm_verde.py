@@ -120,7 +120,7 @@ class HilerasFallasVerdeAlgorithm(QgsProcessingAlgorithm):
     def shortHelpString(self):
         return (
             "Delimita los cuarteles de un ortomosaico, detecta las hileras de cada uno y marca las "
-            "fallas (tramos sin planta), todo a partir del verdor. Puede tardar un par de minutos en una finca de ~13 ha.\n\n"
+            "fallas (tramos sin planta), todo a partir del verdor. Puede tardar un par de minutos, según el tamaño del ortomosaico.\n\n"
             "1) Delimitación de cuarteles: zonas con patrón de hileras (el verdor sin patrón, como monte o "
             "pasto, no es cuartel).\n"
             "2) Rumbo y distancia entre hileras de cada cuartel, por separado, con el índice de verdor que "
