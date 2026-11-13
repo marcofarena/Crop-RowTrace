@@ -2,43 +2,33 @@
 """
 Detección de Hileras de Cultivo
 --------------------------------
-Flujo común:
+Flujo:
   1. Lee el raster de entrada con GDAL (bandas R, G, B elegidas por el
      usuario) y su máscara de píxeles válidos (alfa / nodata).
-  2. Calcula el índice de vegetación ExG cromático (2G-R-B)/(R+G+B) (o, como
-     opción, el ExG sin normalizar 2G-R-B) para resaltar la vegetación.
-  3. Binariza (Otsu automático sobre los píxeles válidos, o umbral manual).
-
-Método "perfil de proyección" (default, hileras rectas y paralelas):
-  4. Estima orientación y separación de hileras con el espectro de
-     potencia 2D del ExG (FFT, promedio de ventanas).
-  5. Remuestrea el ExG a una grilla rotada donde las hileras quedan
+  2. Calcula el índice de vegetación ExG cromático (2G-R-B)/(R+G+B).
+  3. Lote por lote (polígonos de la capa de contorno, cuarteles detectados
+     en la imagen o toda el área con datos), estima orientación y separación
+     de hileras con el espectro de potencia 2D del ExG (FFT, promedio de
+     ventanas).
+  4. Remuestrea el ExG a una grilla rotada donde las hileras quedan
      verticales; los picos del perfil perpendicular son los centros de
      hilera.
-  6. A lo largo de cada hilera, marca como "hilera presente" los tramos
+  5. A lo largo de cada hilera, marca como "hilera presente" los tramos
      donde el centro de la hilera es más verde que las dos entrehileras
      vecinas (contraste local, umbral relativo al ruido, con histéresis), o
      donde continúa su patrón de brillo; ubica los extremos a media altura,
      une huecos cortos y descarta tramos cortos.
-  7. Otros cultivos: en frutales de copa cerrada ubica las hileras sobre
+  6. Otros cultivos: en frutales de copa cerrada ubica las hileras sobre
      las copas iluminadas (verde absoluto), no sobre la sombra entre ellas;
      con hileras finas busca la separación en el espectro blanqueado y, al
      límite de la resolución, marca las hileras por el patrón de varias
      hileras vecinas (modo patrón).
-
-Método "Canny + Hough" (anterior):
-  4. Opcionalmente aplica un cierre morfológico, detecta bordes con Canny y
-     segmentos con la Transformada de Hough probabilística (cv2.HoughLinesP).
-  5. Opcionalmente filtra los segmentos por dirección dominante.
-  6. Fusiona los segmentos de una misma hilera en una sola línea (PCA +
-     tope de longitud + tope de hueco longitudinal).
-
-Final común:
-  7. Recorta las líneas al contorno de la parcela (capa opcional o área con
-     datos del raster) y, en el método de perfil, extiende cada hilera
-     hasta el borde si le falta poco.
-  8. Convierte cada línea de coordenadas de píxel a coordenadas del mapa
-     usando el geotransform del raster, y escribe una capa vectorial.
+  7. Recorta las líneas al lote, las convierte a coordenadas del mapa con
+     el geotransform del raster y escribe una capa vectorial. Opcionales:
+     cuarteles detectados y fallas por hilera (fallas.py).
+El método Canny + Hough (versiones 0.2-0.23) se sacó en la 0.24: con
+hileras angostas y juntas encontraba rectas que cruzan las hileras (F1
+medio 0,27 contra 0,98 en la tanda 2).
 
 Dependencias extra (no vienen con QGIS por defecto):
   - opencv-python (o opencv-python-headless)
@@ -47,6 +37,8 @@ Instalación (ver README.md del plugin).
 """
 
 import math
+import traceback
+
 import numpy as np
 
 from qgis.core import (
@@ -62,6 +54,8 @@ from qgis.core import (
     QgsProcessingParameterBoolean,
     QgsProcessingParameterVectorDestination,
     QgsProcessingException,
+    QgsCoordinateReferenceSystem,
+    QgsCoordinateTransform,
     QgsFields,
     QgsField,
     QgsFeature,
@@ -75,346 +69,9 @@ from qgis.PyQt.QtCore import QVariant, QCoreApplication
 from .bloques import detect_blocks
 
 
-def _angle_deg_mod180(dx, dy):
-    ang = math.degrees(math.atan2(dy, dx)) % 180.0
-    return ang
-
-
 def _angle_diff_mod180(a, b):
     d = abs(a - b) % 180.0
     return min(d, 180.0 - d)
-
-
-def _recompute_cluster(cluster):
-    """Recalcula dirección (PCA), punto de referencia y ángulo del cluster
-    a partir de todos los puntos (extremos de segmentos) que contiene."""
-    pts = np.array(cluster["points"], dtype=np.float64)
-    mean = pts.mean(axis=0)
-    centered = pts - mean
-    cov = np.cov(centered.T)
-    eigvals, eigvecs = np.linalg.eigh(cov)
-    direction = eigvecs[:, np.argmax(eigvals)]  # eigenvector con mayor varianza
-    norm = np.linalg.norm(direction)
-    if norm > 1e-9:
-        direction = direction / norm
-    cluster["point"] = mean
-    cluster["direction"] = direction
-    cluster["angle"] = _angle_deg_mod180(direction[0], direction[1])
-
-
-def _point_perp_distance(px, py, line_point, direction):
-    vx, vy = px - line_point[0], py - line_point[1]
-    cross = vx * direction[1] - vy * direction[0]
-    return abs(cross)
-
-
-def _projection_interval(points, ref_point, direction):
-    """Proyecta una lista de puntos sobre `direction` (a partir de
-    ref_point) y devuelve (min, max) de esas proyecciones — el rango que
-    ocupan esos puntos A LO LARGO de la dirección de la hilera."""
-    pts = np.array(points, dtype=np.float64)
-    proj = (pts - ref_point) @ direction
-    return float(proj.min()), float(proj.max())
-
-
-def estimate_dominant_angle_deg(lines):
-    """Estima la orientación dominante de un conjunto de segmentos, ponderando
-    cada uno por su longitud (no por cantidad). Usa el truco de 'ángulo
-    duplicado' para tratar la orientación (que es periódica cada 180°, no
-    360°) como una cantidad circular: cada segmento aporta un vector de
-    longitud proporcional a su largo real, en dirección 2*ángulo; el ángulo
-    dominante es la dirección del vector resultante (dividida por 2).
-
-    Esto funciona incluso si hay muchísimo ruido en direcciones dispersas
-    (p. ej. bordes de copas de plantas individuales, que no tienen una
-    dirección preferente): esos vectores tienden a cancelarse entre sí,
-    mientras que los segmentos que sí siguen una dirección común (p. ej.
-    bordes reales de hilera) se refuerzan.
-
-    Devuelve (angulo_dominante_deg, concentracion) donde concentracion está
-    en [0, 1]: 0 = direcciones completamente dispersas (sin una orientación
-    dominante clara), 1 = todos los segmentos perfectamente alineados.
-    Devuelve (None, 0.0) si no hay segmentos."""
-    if len(lines) == 0:
-        return None, 0.0
-
-    sum_cos = 0.0
-    sum_sin = 0.0
-    total_len = 0.0
-    for (x1, y1, x2, y2) in lines:
-        length = math.hypot(x2 - x1, y2 - y1)
-        if length < 1e-9:
-            continue
-        ang = _angle_deg_mod180(x2 - x1, y2 - y1)
-        theta2 = math.radians(2.0 * ang)
-        sum_cos += length * math.cos(theta2)
-        sum_sin += length * math.sin(theta2)
-        total_len += length
-
-    if total_len < 1e-9:
-        return None, 0.0
-
-    mean_theta2 = math.atan2(sum_sin, sum_cos)
-    dominant_angle = (math.degrees(mean_theta2) / 2.0) % 180.0
-    concentration = math.hypot(sum_cos, sum_sin) / total_len
-    return dominant_angle, concentration
-
-
-def filter_lines_by_angle(lines, target_angle_deg, tol_deg):
-    """Descarta los segmentos cuyo ángulo (mod 180°) se aleja de
-    target_angle_deg más que tol_deg. Se aplica ANTES de la fusión, para
-    que el ruido en otras direcciones (bordes de copas individuales,
-    caminos, límites de parcela con otra orientación) no llegue siquiera
-    a la etapa de fusión."""
-    kept = []
-    for seg in lines:
-        x1, y1, x2, y2 = seg
-        ang = _angle_deg_mod180(x2 - x1, y2 - y1)
-        if _angle_diff_mod180(ang, target_angle_deg) <= tol_deg:
-            kept.append(seg)
-    return kept
-
-
-def _normalize_vec(vx, vy):
-    n = math.hypot(vx, vy)
-    if n < 1e-9:
-        return 0.0, 0.0
-    return vx / n, vy / n
-
-
-def estimate_perp_spacing_px(lines, dominant_angle_deg, bin_px=2.0):
-    """Estima la separación perpendicular típica entre hileras vecinas a
-    partir de los segmentos SIN fusionar (ya filtrados por dirección),
-    usando autocorrelación: proyecta el punto medio de cada segmento sobre
-    el eje perpendicular a la dirección dominante, arma un histograma de
-    densidad a lo largo de ese eje, y busca la periodicidad dominante de
-    ese histograma. Es la misma técnica que separar las notas de un
-    acorde: si hay hileras regularmente espaciadas, la densidad de puntos
-    va a repetirse con ese período.
-
-    A diferencia de estimate_row_spacing_px (que mide distancia entre
-    hileras YA fusionadas, una línea por hilera), esta función mide sobre
-    los segmentos crudos — sirve para calibrar la tolerancia de fusión
-    ANTES de fusionar, que es lo que realmente hace falta.
-
-    Devuelve la separación en píxeles, o None si no hay suficientes datos
-    o no se detecta una periodicidad clara."""
-    if len(lines) < 6:
-        return None
-
-    theta = math.radians(dominant_angle_deg)
-    perp = (-math.sin(theta), math.cos(theta))
-    offsets = []
-    for (x1, y1, x2, y2) in lines:
-        mx, my = (x1 + x2) / 2.0, (y1 + y2) / 2.0
-        offsets.append(mx * perp[0] + my * perp[1])
-    offsets = np.array(offsets, dtype=np.float64)
-
-    lo, hi = offsets.min(), offsets.max()
-    span = hi - lo
-    if span < bin_px * 6:
-        return None
-
-    n_bins = int(span / bin_px) + 1
-    hist, _ = np.histogram(offsets, bins=n_bins, range=(lo, hi))
-    density = hist.astype(np.float64)
-    density -= density.mean()
-    if np.allclose(density, 0.0):
-        return None
-
-    # Autocorrelación vía FFT (mucho más rápido y estable que calcularla
-    # "a mano" desplazando el array), quedándonos solo con lags positivos.
-    n = len(density)
-    padded = np.zeros(2 * n)
-    padded[:n] = density
-    f = np.fft.rfft(padded)
-    power = (f * np.conj(f)).real
-    autocorr = np.fft.irfft(power)[:n]
-
-    min_lag = max(2, int(round(1.0 / bin_px)) + 1)
-    if n <= min_lag + 2:
-        return None
-
-    peak_lag = min_lag + int(np.argmax(autocorr[min_lag:]))
-    if autocorr[peak_lag] <= 0:
-        return None
-
-    return peak_lag * bin_px
-
-
-def merge_segments_into_rows(lines, angle_tol_deg, dist_tol_px, max_length_px=None, max_gap_px=None):
-    """
-    Agrupa segmentos de Hough que pertenecen a la misma hilera (ángulo
-    similar + cercanos perpendicularmente + cercanos a lo largo de la
-    hilera) y devuelve UNA línea por grupo, ajustada por PCA y extendida
-    al alcance real de todos sus segmentos.
-
-    max_length_px (opcional): tope duro a cuánto puede "crecer" una hilera
-    fusionada en total.
-
-    max_gap_px (opcional, la corrección más importante): espacio máximo,
-    medido A LO LARGO de la hilera (no perpendicular), entre el tramo ya
-    fusionado y el próximo segmento candidato. Sin este chequeo, dos
-    segmentos con ángulo y offset perpendicular parecidos se fusionan
-    aunque estén a cientos de píxeles de distancia entre sí a lo largo de
-    la hilera (con un camino, un límite de parcela, o cualquier zona sin
-    relación en el medio) — incluso en un campo con una única dirección
-    real consistente en toda la escena. Es la causa más común de líneas
-    absurdamente largas que cruzan zonas sin relación entre sí.
-    """
-    clusters = []
-
-    for (x1, y1, x2, y2) in lines:
-        seg_angle = _angle_deg_mod180(x2 - x1, y2 - y1)
-        seg_mid = ((x1 + x2) / 2.0, (y1 + y2) / 2.0)
-
-        assigned = False
-        for cluster in clusters:
-            if _angle_diff_mod180(seg_angle, cluster["angle"]) <= angle_tol_deg:
-                d = _point_perp_distance(seg_mid[0], seg_mid[1], cluster["point"], cluster["direction"])
-                if d <= dist_tol_px:
-                    if max_gap_px is not None:
-                        c_min, c_max = _projection_interval(
-                            cluster["points"], cluster["point"], cluster["direction"]
-                        )
-                        s_min, s_max = _projection_interval(
-                            [(x1, y1), (x2, y2)], cluster["point"], cluster["direction"]
-                        )
-                        gap = max(0.0, s_min - c_max, c_min - s_max)
-                        if gap > max_gap_px:
-                            continue  # mismo angulo/offset, pero demasiado lejos a lo largo de la hilera
-                    if max_length_px is not None:
-                        trial_pts = np.array(cluster["points"] + [(x1, y1), (x2, y2)], dtype=np.float64)
-                        proj = (trial_pts - cluster["point"]) @ cluster["direction"]
-                        trial_length = float(proj.max() - proj.min())
-                        if trial_length > max_length_px:
-                            continue  # rechazar esta fusión, probar con otro cluster
-                    cluster["points"].append((x1, y1))
-                    cluster["points"].append((x2, y2))
-                    _recompute_cluster(cluster)
-                    assigned = True
-                    break
-
-        if not assigned:
-            new_cluster = {"points": [(x1, y1), (x2, y2)]}
-            _recompute_cluster(new_cluster)
-            clusters.append(new_cluster)
-
-    merged_lines = []
-    for cluster in clusters:
-        pts = np.array(cluster["points"], dtype=np.float64)
-        direction = cluster["direction"]
-        point = cluster["point"]
-        # proyectar cada punto sobre la dirección principal para hallar los extremos
-        projections = (pts - point) @ direction
-        p_min = pts[np.argmin(projections)]
-        p_max = pts[np.argmax(projections)]
-        merged_lines.append((p_min[0], p_min[1], p_max[0], p_max[1]))
-
-    return merged_lines
-
-
-def estimate_row_spacing_px(lines):
-    """Distancia mediana (en píxeles) entre hileras vecinas, proyectando el
-    punto medio de cada una sobre el eje perpendicular a la dirección
-    dominante de todas las hileras. Devuelve None si hay menos de 2 hileras
-    (no se puede estimar un espaciado). Se usa DESPUÉS de fusionar (una
-    línea por hilera) — para calibrar el ancho de franja cultivable del
-    cálculo de cobertura/conteo de plantas, no para la fusión en sí (eso
-    lo hace estimate_perp_spacing_px, sobre los segmentos sin fusionar)."""
-    if len(lines) < 2:
-        return None
-
-    dirs = []
-    for (x1, y1, x2, y2) in lines:
-        dx, dy = _normalize_vec(x2 - x1, y2 - y1)
-        if dx < 0:
-            dx, dy = -dx, -dy
-        dirs.append((dx, dy))
-    avg_dx = float(np.mean([d[0] for d in dirs]))
-    avg_dy = float(np.mean([d[1] for d in dirs]))
-    avg_dx, avg_dy = _normalize_vec(avg_dx, avg_dy)
-    perp = (-avg_dy, avg_dx)
-
-    offsets = []
-    for (x1, y1, x2, y2) in lines:
-        mx, my = (x1 + x2) / 2.0, (y1 + y2) / 2.0
-        offsets.append(mx * perp[0] + my * perp[1])
-    offsets.sort()
-    gaps = [offsets[i + 1] - offsets[i] for i in range(len(offsets) - 1)]
-    if not gaps:
-        return None
-    return float(np.median(gaps))
-
-
-def _strip_mask_bbox(x1, y1, x2, y2, half_width_px, shape):
-    """Devuelve (row_min, row_max, col_min, col_max) y una máscara booleana
-    (del tamaño de ese recorte) True para los píxeles que caen dentro de la
-    franja cultivable de la hilera: cerca perpendicularmente (<= half_width_px)
-    y dentro del alcance a lo largo de la línea."""
-    H, W = shape
-    dx, dy = _normalize_vec(x2 - x1, y2 - y1)
-    perp = (-dy, dx)
-    length = math.hypot(x2 - x1, y2 - y1)
-
-    xs = [x1, x2, x1 + perp[0]*half_width_px, x1 - perp[0]*half_width_px,
-          x2 + perp[0]*half_width_px, x2 - perp[0]*half_width_px]
-    ys = [y1, y2, y1 + perp[1]*half_width_px, y1 - perp[1]*half_width_px,
-          y2 + perp[1]*half_width_px, y2 - perp[1]*half_width_px]
-    col_min = max(0, int(math.floor(min(xs))))
-    col_max = min(W - 1, int(math.ceil(max(xs))))
-    row_min = max(0, int(math.floor(min(ys))))
-    row_max = min(H - 1, int(math.ceil(max(ys))))
-    if col_max <= col_min or row_max <= row_min:
-        return (row_min, row_max, col_min, col_max), None
-
-    cols = np.arange(col_min, col_max + 1)
-    rows = np.arange(row_min, row_max + 1)
-    cc, rr = np.meshgrid(cols, rows)
-
-    vx, vy = cc - x1, rr - y1
-    along = vx * dx + vy * dy
-    perp_dist = vx * perp[0] + vy * perp[1]
-
-    mask = (np.abs(perp_dist) <= half_width_px) & (along >= 0) & (along <= length)
-    return (row_min, row_max, col_min, col_max), mask
-
-
-def compute_row_coverage_and_count(cv2_module, binary_u8, x1, y1, x2, y2,
-                                    half_width_px, min_plant_area_px, pixel_area_m2):
-    """Calcula, para la franja cultivable alrededor de una hilera:
-      - % de cobertura de vegetación dentro de esa franja
-      - número estimado de plantas (componentes conectados en la máscara
-        binaria, filtrando blobs más chicos que min_plant_area_px)
-      - área promedio de esos blobs (m2), como dato de diagnóstico: si es
-        mucho más grande de lo esperado para una sola planta, es señal de
-        que el dosel está cerrado y el conteo está subestimado.
-    Devuelve un dict con claves cobertura_pct, num_plantas, area_prom_m2
-    (todas en None si no hay píxeles válidos en la franja)."""
-    H, W = binary_u8.shape
-    (row_min, row_max, col_min, col_max), mask = _strip_mask_bbox(
-        x1, y1, x2, y2, half_width_px, (H, W)
-    )
-    if mask is None or mask.sum() == 0:
-        return {"cobertura_pct": None, "num_plantas": None, "area_prom_m2": None}
-
-    sub_bin = binary_u8[row_min:row_max + 1, col_min:col_max + 1]
-    total_px = int(mask.sum())
-    veg_px = int(((sub_bin > 0) & mask).sum())
-    cobertura_pct = 100.0 * veg_px / total_px
-
-    sub_masked = np.where(mask, sub_bin, 0).astype(np.uint8)
-    num_labels, labels, stats, _ = cv2_module.connectedComponentsWithStats(sub_masked, connectivity=8)
-    areas = stats[1:, cv2_module.CC_STAT_AREA]  # excluir el fondo (label 0)
-    areas = areas[areas >= min_plant_area_px]
-    num_plantas = int(len(areas))
-    area_prom_m2 = float(areas.mean() * pixel_area_m2) if num_plantas > 0 else 0.0
-
-    return {
-        "cobertura_pct": cobertura_pct,
-        "num_plantas": num_plantas,
-        "area_prom_m2": area_prom_m2,
-    }
 
 
 # ---------------------------------------------------------------------------
@@ -547,6 +204,13 @@ def estimate_row_orientation_fft(img, valid, period_hint_px=None, tile_px=512, m
 
     masked = np.where(band, acc, 0.0)
     iy, ix = np.unravel_index(int(np.argmax(masked)), masked.shape)
+    if not masked[iy, ix] > 0:
+        # Sin potencia en la banda de búsqueda: la zona es uniforme (el negro
+        # o el blanco de un recorte sin transparencia, un techo, agua) y no hay
+        # patrón que medir. Sin este control el "pico" quedaba en la frecuencia
+        # cero y el período daba una división por cero, que cortaba la corrida
+        # entera (también los demás lotes).
+        return None, None, 0.0
 
     def pk_period_angle(iy_, ix_):
         per_ = 1.0 / float(fr[iy_, ix_])
@@ -575,10 +239,15 @@ def estimate_row_orientation_fft(img, valid, period_hint_px=None, tile_px=512, m
     # fuerte: el lote quedaba a 0,38 m y sin líneas.
     rbin = np.round(fr * tile).astype(np.int64)
     ring_med = np.ones(int(rbin.max()) + 1)
-    for r_ in range(len(ring_med)):
-        v_ = acc[rbin == r_]
-        if v_.size:
-            ring_med[r_] = max(float(np.median(v_)), 1e-30)
+    # Los bins se ordenan por anillo una sola vez (antes, una máscara de toda
+    # la ventana por cada anillo, ~360 veces: 0,2 s por llamada). Mismos
+    # valores por anillo, misma mediana.
+    acc_ring = acc.reshape(-1)[np.argsort(rbin, axis=None, kind="stable")]
+    a_ = 0
+    for r_, e_ in enumerate(np.cumsum(np.bincount(rbin.reshape(-1), minlength=len(ring_med)))):
+        if e_ > a_:
+            ring_med[r_] = max(float(np.median(acc_ring[a_:e_])), 1e-30)
+        a_ = e_
     white = acc / ring_med[rbin]
 
     def local_max(m_):
@@ -646,7 +315,7 @@ def estimate_row_orientation_fft(img, valid, period_hint_px=None, tile_px=512, m
             # de su anillo: el usuario ya dijo dónde buscar, y en ese olivar
             # las hileras apenas se veían en el verdor (3 veces su anillo) y
             # sí en el brillo.
-            pk_b = local_max(np.where(band_all, acc, 0.0))
+            pk_b = pk_all
             inb = band[pk_b]
             pk = (pk_b[0][inb], pk_b[1][inb])
             ok_ = np.zeros(len(pk[0]), bool)
@@ -999,8 +668,15 @@ TRACK_REFIT_T = 0.2
 # persigue el ruido.
 TRACK_MIN_T_PX = 6.0
 # Hueco máximo dentro de una hilera: al menos GAP_T separaciones entre
-# hileras (ver el paso 5 de detect_rows_by_profile).
-GAP_T = 1.25
+# hileras (ver el paso 5 de detect_rows_by_profile). En viñedo (2-2,6 m) manda
+# el hueco máximo en metros (7,5 m); en frutales más anchos, este piso: a 5 m
+# entre hileras, 12 m (3-4 árboles faltantes no cortan la hilera). Con 1,25
+# (hasta la 0.24) y 7,5 m, el frutal de Finca 500 se cortaba donde faltaban
+# árboles (F1 0,966); con 2,4, 0,978. En las 23 referencias, 0,974 -> 0,975
+# (sube un olivar a 12 m 0,936 -> 0,940 y un frutal a 4,9 m 0,951 -> 0,953;
+# bajan 0,001 dos frutales a 5-7 m, que unen huecos cortados en su referencia).
+# Con 2,0 y 2,2 el olivar bajaba a 0,930.
+GAP_T = 2.4
 PATTERN_ROWS = 5
 PATTERN_LEN_T = 10.0
 # Entrehileras alternadas (rastra o cobertura hilera por medio): en la
@@ -1018,12 +694,87 @@ ALT_D = 2.0
 ALT_PAIRS = 0.5
 ALT_OPP = 0.9
 ALT_TOL = 3.0
+# Banda oscura asimétrica (franja oscura elegida porque la canopia no se ve
+# verde: vid sin hojas, de otoño o rojiza): lo más oscuro es la sombra, en un
+# borde de la banda, y la planta queda del otro lado, menos oscura. La línea de
+# salida va al centro a media altura de la banda en vez de a su pico. Se mide
+# en el perfil a lo ancho de cada hilera y se aplica a todo el lote la mediana,
+# solo si es al menos HALF_MIN_T * T y al menos HALF_SAME de las hileras van
+# para el mismo lado (la sombra cae siempre del mismo lado); como mucho
+# HALF_MAX_T * T. En las referencias de la tanda 2, la línea del usuario cae en
+# ese centro (0,00 y 0,04 T de la banda media) y no en lo más oscuro (0,35 y
+# 0,21 T). En los demás lotes la mediana es < 0,08 T o va para los dos lados.
+HALF_MIN_T = 0.1
+HALF_SAME = 0.9
+HALF_MAX_T = 0.25
+# Siembra por evidencia débil sostenida: una racha de evidencia débil (la
+# hilera más marcada que sus DOS entrehileras y > 1 ruido) de al menos
+# WEAK_SEED_T separaciones y con evidencia media >= WEAK_SEED_M ruidos siembra
+# un tramo aunque no tenga una racha fuerte (> k_sigma ruidos) de largo T. El
+# contraste está suavizado a lo largo de T: en 3T hay ~3 valores casi
+# independientes, y que el ruido los dé los tres > 1 con media 1,5 es raro.
+# Visto en la tanda 2: viñedos sin hojas y un frutal con hileras parejas pero
+# tenues (2-3 ruidos) cortadas en pedazos o sin línea; frutal F1 0,68 -> 0,94,
+# viñedo 0,72 -> 0,79; ningún lote con referencia empeora. Riesgo: en un lote
+# con cobertura muy cargada (descartado por la imagen) siembra franjas de
+# cobertura de la entrehilera (170 m de líneas falsas en 1 ha).
+WEAK_SEED_T = 3.0
+WEAK_SEED_M = 1.5
+# Centro de la banda (franja oscura): cada hilera se ubica en el centro a media
+# altura de su banda y no en su pico (lo más oscuro), si así se ve mejor. Casos:
+# vid sin hojas (lo más oscuro es la sombra, a un costado de la planta) y
+# hortícola en camellones (la banda oscura entre dos líneas claras tiene dos
+# jorobas y el pico cae en una de ellas, a ~T/4 del centro). Desde el pico, una
+# de las entrehileras (±T/2) cae dentro de la banda y el contraste casi
+# desaparece: hileras sin línea o cortadas. Se decide por lote: el largo de
+# hilera presente (pasada 1) en el centro tiene que superar al del pico en la
+# fracción band_gain (ver _detect_rows_profile). Corrimiento máximo BAND_MAX_T.
+# Visto en la tanda 2: hortícola F1 0,62 -> 0,89; vid sin hojas 0,75 -> 0,96 y
+# 0,79 -> 0,98. En un frutal y un viñedo de canopia verde la línea del usuario
+# está en el pico (la copa) y el centro la corría 0,3-0,5 m: ahí no se aplica.
+BAND_MAX_T = 0.35
+BAND_MOVED_T = 0.05      # una hilera "se movió" si el centro dista más que esto del pico
+# Rumbo propio por hilera: el ángulo es uno por lote, pero las hileras de una
+# plantación no son exactamente paralelas (en la tanda 2, hasta 1,5° de
+# diferencia dentro de un lote: 0,8 T de deriva en 70 m). La recta coincidía con
+# la hilera solo en el medio y la línea se cortaba a mitad de hilera; con
+# hileras cortas (< 4 bloques de la pasada 2) la pendiente propia no se
+# ajustaba nunca. Antes de la pasada 2, cada hilera prueba inclinaciones de
+# hasta SLOPE_MAX_T * T de deriva a lo largo de su largo, en pasos de
+# T / SLOPE_RES, sobre el perfil de columnas de la grilla inclinada (una sola
+# inclinación de la imagen entera por paso). Se queda con la inclinación si su
+# contraste supera al de la recta del lote en SLOPE_GAIN, si al menos SLOPE_NB
+# de sus 4 vecinas eligieron una inclinación a no más de SLOPE_NB_K pasos (el
+# rumbo cambia de a poco a lo ancho del lote; una inclinación suelta es ruido:
+# en un viñedo de hileras finas inclinaba hileras sueltas y cortaba puntas) y si
+# su recta no se acerca a menos de T/2 de la de una vecina (visto: líneas
+# duplicadas sobre la hilera de al lado). Tanda 2: viñedo 0,86 -> 0,96,
+# hortícola 0,89 -> 0,95.
+SLOPE_RES = 8.0
+SLOPE_MAX_T = 1.0
+SLOPE_GAIN = 0.1
+SLOPE_NB = 2
+SLOPE_NB_K = 2
+# Hileras con mucho más rumbo propio (en la tanda 2, un hortícola con una franja
+# de 18 hileras a ~2° del resto: 1,5-1,75 T de deriva en 100 m, cada línea
+# empezaba en una hilera y terminaba en la siguiente). Dos fallas: (1) a mitad
+# de hilera la recta del lote cae entre dos hileras reales (a ±T/2) y la
+# búsqueda a ±T/4 se quedaba con una inclinación chica y falsa; se descarta si
+# a ±T/2 hay una alineación SLOPE_PHASE_GAIN mejor. (2) La inclinación
+# necesaria pasa la de la búsqueda propia (SLOPE_MAX_T): una hilera sin rumbo
+# propio junto a una que lo tomó busca su hilera a una separación de la recta
+# de la vecina, con una inclinación parecida, hasta SLOPE_PROP_MAX_T de deriva
+# (propagación). Ampliar la búsqueda propia a 2 T empeoraba un viñedo (0,964 ->
+# 0,959: hileras sueltas tomaban inclinaciones de más).
+SLOPE_PHASE_GAIN = 0.25
+SLOPE_PROP_MAX_T = 2.0
 
 
 def detect_rows_by_profile(cv2_module, img, valid, angle_deg, period_px,
                            min_len_px, max_gap_px, k_sigma=3.0, aux=None,
                            aux_localiza=False, row_valid=None, level_min=LEVEL_MIN,
-                           wide_rows=False, track_max_px=None, aux_siembra=False, shadow_px=0.0):
+                           wide_rows=False, track_max_px=None, aux_siembra=False, shadow_px=0.0,
+                           half_center=False, band_gain=None, canceled=None):
     """Detecta hileras rectas y paralelas, de orientación angle_deg y
     separación period_px (coordenadas de imagen), sobre el índice de
     vegetación img. Devuelve (segmentos, ids_hilera, info):
@@ -1097,11 +848,32 @@ def detect_rows_by_profile(cv2_module, img, valid, angle_deg, period_px,
     hilera se prolonga planta por planta (evidencia a escala de planta,
     T/3) mientras haya plantas a menos de T una de otra: las plantas chicas
     de la punta (replantes, menor vigor) no alcanzan la evidencia de las
-    grandes una vez promediadas, pero la hilera sigue hasta ellas."""
+    grandes una vez promediadas, pero la hilera sigue hasta ellas.
+
+    half_center=True (franja oscura porque la canopia no se ve verde): las
+    líneas de salida van al centro a media altura de la banda, no a su pico
+    (lo más oscuro, la sombra), si la banda es claramente asimétrica en todo
+    el lote (ver HALF_MIN_T). La detección no cambia.
+
+    band_gain (franja oscura; None = no): las hileras se ubican en el centro a
+    media altura de su banda, en la pasada 1 y en los bloques de la pasada 2,
+    si en la pasada 1 eso da al menos (1 + band_gain) veces el largo de
+    hilera presente que el pico (ver BAND_MAX_T).
+
+    Antes de la pasada 2 cada hilera puede tomar una pendiente propia (ver
+    SLOPE_RES).
+
+    canceled (opcional): función sin argumentos que dice si el usuario
+    canceló; se consulta hilera por hilera y, si canceló, se devuelve ([], [],
+    info) enseguida (un lote grande tarda minutos y antes "Cancelar" no hacía
+    nada hasta que terminaba)."""
     cv2 = cv2_module
     H, W = img.shape
     T = float(period_px)
     info = {"n_hileras": 0, "sigma": None, "tau": None}
+
+    def stop():
+        return canceled is not None and canceled()
 
     th = math.radians(angle_deg)
     u = (math.cos(th), math.sin(th))     # a lo largo de la hilera
@@ -1191,6 +963,14 @@ def detect_rows_by_profile(cv2_module, img, valid, angle_deg, period_px,
     box = np.ones(max(3, int(round(T))))
     box_p = np.ones(max(3, int(round(T / 3.0))))  # escala de una planta
     ss = np.arange(NS)
+    # La grilla como vector: el punto (fila i, columna k) es el elemento
+    # i * NT + k. contrast_along se llama miles de veces por lote (un tercio
+    # del tiempo total) y leer así es más rápido que con [filas, columnas];
+    # da exactamente los mismos valores.
+    ss_off = ss.astype(np.int64) * NT
+    nt_1 = NT - 1
+    R_flat, RV_flat, RR_flat = R.reshape(-1), RV.reshape(-1), RR.reshape(-1)
+    RA_flat = None if RA is None else RA.reshape(-1)
 
     def contrast_along(a0, a1, dt=None):
         """Contrastes centro de hilera vs. entrehileras (±T/2) a lo largo de
@@ -1208,11 +988,15 @@ def detect_rows_by_profile(cv2_module, img, valid, angle_deg, period_px,
             tt = tt + dt   # camino seguido (hilera levemente torcida)
         base = np.floor(tt).astype(np.int64)
         jc = np.round(tt).astype(np.int64)
-        ok = (jc >= 0) & (jc < NT) & RR[ss, np.clip(jc, 0, NT - 1)]
+        # (mínimo y máximo en vez de np.clip, que en vectores cortos tarda
+        # varias veces más: mismo resultado)
+        ok = (jc >= 0) & (jc < NT) & RR_flat[ss_off + np.minimum(np.maximum(jc, 0), nt_1)]
         taps = {"c": []}
+        t_lo, t_hi = tt - hw, tt + hw
         for d in range(-K, K + 1):
             k = base + d
-            taps["c"].append((k, np.clip(np.minimum(k + 0.5, tt + hw) - np.maximum(k - 0.5, tt - hw), 0.0, 1.0)))
+            taps["c"].append((k, np.minimum(np.maximum(
+                np.minimum(k + 0.5, t_hi) - np.maximum(k - 0.5, t_lo), 0.0), 1.0)))
         for key, offset in (("l", -T / 2.0), ("r", T / 2.0)):
             x = tt + offset
             k0 = np.floor(x).astype(np.int64)
@@ -1222,9 +1006,9 @@ def detect_rows_by_profile(cv2_module, img, valid, angle_deg, period_px,
             clean = []
             for k, w in taps[key]:
                 used = w > 1e-9
-                kc = np.clip(k, 0, NT - 1)
-                ok &= ~used | ((k >= 0) & (k < NT) & RV[ss, kc])
-                clean.append((kc, np.where(used, w, 0.0)))
+                kf = ss_off + np.minimum(np.maximum(k, 0), nt_1)   # índice en la grilla como vector
+                ok &= ~used | ((k >= 0) & (k < NT) & RV_flat[kf])
+                clean.append((kf, np.where(used, w, 0.0)))
             wsum = np.maximum(sum(w for _, w in clean), 1e-12)
             taps[key] = (clean, wsum)
         okf = ok.astype(np.float64)
@@ -1235,11 +1019,11 @@ def detect_rows_by_profile(cv2_module, img, valid, angle_deg, period_px,
             return np.convolve(np.where(ok, x, 0.0), box, "same") / norm
 
         out = []
-        for G in (R, RA):
+        for G in (R_flat, RA_flat):
             if G is None:
                 out.append(None)
                 continue
-            c, l, r = (sum(G[ss, k] * w for k, w in taps[key][0]) / taps[key][1] for key in ("c", "l", "r"))
+            c, l, r = (sum(G[k] * w for k, w in taps[key][0]) / taps[key][1] for key in ("c", "l", "r"))
             con_s = smooth(c - 0.5 * (l + r))
             con_s[~ok] = np.nan
             plant = np.convolve(np.where(ok, np.minimum(c - l, c - r), 0.0), box_p, "same") / norm_p
@@ -1263,11 +1047,18 @@ def detect_rows_by_profile(cv2_module, img, valid, angle_deg, period_px,
     # Pasada 1: recta con el ángulo global por el pico (sub-píxel) del
     # perfil. Alcanza para estimar el ruido y el umbral de presencia.
     rows = []
+    band_alt = {}   # hilera -> (centro de la banda, se movió)
     for j in centers:
+        if stop():
+            return [], [], info
         a_, b_, c_ = prof_s[j - 1], prof_s[j], prof_s[j + 1]
         den = a_ - 2.0 * b_ + c_
         off = 0.5 * (a_ - c_) / den if abs(den) > 1e-12 else 0.0
         a0 = j + float(np.clip(off, -0.5, 0.5))
+        if band_gain is not None:
+            hc_ = half_height_center(prof_s, j, T)
+            if hc_ is not None and abs(hc_ - a0) <= BAND_MAX_T * T:
+                band_alt[len(rows)] = (float(hc_), abs(hc_ - a0) > BAND_MOVED_T * T)
         main, auxc = contrast_along(a0, 0.0)
         rows.append([a0, 0.0, main, auxc])
 
@@ -1278,6 +1069,32 @@ def detect_rows_by_profile(cv2_module, img, valid, angle_deg, period_px,
     sigma = noise_rms(allc)
     tau = k_sigma * sigma
     info["sigma"], info["tau"] = sigma, tau
+
+    # Centro de la banda (ver BAND_MAX_T): se compara el largo de hilera
+    # presente en el pico y en el centro, con el mismo umbral, en las hileras
+    # donde difieren.
+    band_on = False
+    info["centro_banda"] = 0
+    moved_ = [i_ for i_, (_, m_) in band_alt.items() if m_]
+    if moved_:
+        alt_c = {i_: contrast_along(a_, 0.0) for i_, (a_, _) in band_alt.items()}
+
+        def present_len(m_):
+            return float(presence(m_[0], np.minimum(m_[1], m_[2]), tau).sum())
+
+        p_pk = sum(present_len(rows[i_][2]) for i_ in moved_)
+        p_bc = sum(present_len(alt_c[i_][0]) for i_ in moved_)
+        info["banda_presencia"] = (p_pk, p_bc)
+        band_on = p_bc >= (1.0 + band_gain) * p_pk
+        if band_on:
+            for i_, (a_, m_) in band_alt.items():
+                rows[i_][0] = a_
+                rows[i_][2], rows[i_][3] = alt_c[i_]
+                info["centro_banda"] += int(m_)
+            allc = np.concatenate([r[2][0][np.isfinite(r[2][0])] for r in rows])
+            sigma = noise_rms(allc)
+            tau = k_sigma * sigma
+            info["sigma"], info["tau"] = sigma, tau
 
     def main_presence(row, thr):
         con_s, dl, dr = row[2][:3]
@@ -1453,6 +1270,140 @@ def detect_rows_by_profile(cv2_module, img, valid, angle_deg, period_px,
             centers = [centers[i] for i in order]
     info["n_agregadas"] = len(added)
 
+    # --- Rumbo propio por hilera (ver SLOPE_RES). Cada paso inclina la grilla
+    # entera alrededor de su fila central ic_: la columna x de la grilla
+    # inclinada junta los puntos t = x + sg * (i - ic_). Para cada hilera se
+    # busca, en cada inclinación, el máximo del contraste del perfil de
+    # columnas (centro menos la media de ±T/2) a menos de T/4 de donde la
+    # hilera pasa por el medio de su propio largo.
+    info["pendiente_propia"] = 0
+    if rows:
+        len_r, mid_r = [], []   # largo de cada hilera (filas de la grilla) y su fila media
+        for r_ in rows:
+            ii_ = np.nonzero(RR[:, min(max(int(round(r_[0])), 0), NT - 1)])[0]
+            len_r.append(len(ii_))
+            mid_r.append(float(np.median(ii_)) if len(ii_) else 0.5 * (NS - 1))
+        len_r = np.array(len_r, float)
+        len_med = float(np.median(len_r[len_r > 0])) if (len_r > 0).any() else 0.0
+        if len_med >= 6.0 * T:
+            d_sg = T / (SLOPE_RES * len_med)
+            n_sg = int(round(SLOPE_MAX_T * SLOPE_RES))          # búsqueda propia de cada hilera
+            n_all = max(n_sg, int(round(SLOPE_PROP_MAX_T * SLOPE_RES)))   # propagación desde vecinas
+            ic_ = 0.5 * (NS - 1)
+            Rz_ = np.where(RV, R, 0.0).astype(np.float32)
+            Vz_ = RV.astype(np.float32)
+            xs_ = np.arange(NT, dtype=np.float64)
+            Q_ = []   # perfil de contraste por paso: Q_[kk + n_all]
+            for kk in range(-n_all, n_all + 1):
+                if stop():
+                    return [], [], info
+                sg_ = kk * d_sg
+                Mk_ = np.array([[1.0, sg_, -sg_ * ic_], [0.0, 1.0, 0.0]])
+                num_, den_ = (
+                    np.convolve(np.pad(cv2.warpAffine(G_, Mk_, (NT, NS),
+                                                      flags=cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP,
+                                                      borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+                                       .sum(axis=0).astype(np.float64), rad, mode="edge"), gk, mode="valid")
+                    for G_ in (Rz_, Vz_))
+                p_ = np.where(den_ >= max(min_len_px, 1), num_ / np.maximum(den_, 1e-9), np.nan)
+                Q_.append(p_ - 0.5 * (np.interp(xs_ - T / 2.0, xs_, p_) + np.interp(xs_ + T / 2.0, xs_, p_)))
+
+            def best_in(q_, x_, w_=0.25):
+                """Máximo (sub-píxel) de q_ a menos de w_ * T de x_: (posición, valor)."""
+                lo_ = max(int(math.ceil(x_ - w_ * T)), 1)
+                hi_ = min(int(math.floor(x_ + w_ * T)), NT - 2)
+                if hi_ < lo_ or not np.isfinite(q_[lo_:hi_ + 1]).any():
+                    return None, -np.inf
+                k_ = lo_ + int(np.nanargmax(q_[lo_:hi_ + 1]))
+                a_, b_, c_ = q_[k_ - 1], q_[k_], q_[k_ + 1]
+                den = a_ - 2.0 * b_ + c_
+                off = 0.5 * (a_ - c_) / den if (np.isfinite(den) and abs(den) > 1e-12) else 0.0
+                return k_ + float(np.clip(off, -0.5, 0.5)), float(b_)
+
+            cand_ = []   # por hilera: (paso, posición en ic_) de la mejor inclinación, o None
+            for r_, im_ in zip(rows, mid_r):
+                sc_ = [best_in(Q_[kk + n_all], r_[0] - kk * d_sg * (im_ - ic_)) for kk in range(-n_sg, n_sg + 1)]
+                s0_ = sc_[n_sg][1]
+                kb_ = int(np.argmax([s_ for _, s_ in sc_]))
+                xb_, sb_ = sc_[kb_]
+                # a media separación (±T/2) hay una alineación mucho mejor: la
+                # recta del lote pasa por el medio de la hilera entre dos hileras
+                # reales (ver SLOPE_PHASE_GAIN) y lo de ±T/4 es un falso máximo
+                wide_ = max(best_in(Q_[kk + n_all], r_[0] - kk * d_sg * (im_ - ic_), 0.5)[1]
+                            for kk in range(-n_sg, n_sg + 1))
+                if (kb_ == n_sg or xb_ is None or not np.isfinite(sb_) or sb_ <= 0
+                        or (np.isfinite(s0_) and s0_ > 0 and sb_ < (1.0 + SLOPE_GAIN) * s0_)
+                        or wide_ > (1.0 + SLOPE_PHASE_GAIN) * sb_):
+                    cand_.append(None)
+                else:
+                    cand_.append((kb_ - n_sg, xb_))
+            new_ = {}
+            for i_, c_ in enumerate(cand_):
+                if c_ is None:
+                    continue
+                nb_ = [cand_[q_] for q_ in range(i_ - 2, i_ + 3) if q_ != i_ and 0 <= q_ < len(cand_)]
+                if sum(1 for d_ in nb_ if d_ is not None and abs(d_[0] - c_[0]) <= SLOPE_NB_K) >= SLOPE_NB:
+                    new_[i_] = (c_[1] - c_[0] * d_sg * ic_, c_[0] * d_sg)
+
+            def clash(i_, a0_, a1_, only_new=False):
+                """¿La recta (a0_, a1_) de la hilera i_ se acerca a menos de T/2
+                de la de una vecina (o la cruza) a lo largo de la hilera?
+                only_new: solo contra vecinas que ya tomaron rumbo propio."""
+                s_a, s_b = mid_r[i_] - 0.5 * len_r[i_], mid_r[i_] + 0.5 * len_r[i_]
+                for q_ in (i_ - 1, i_ + 1):
+                    if 0 <= q_ < len(rows) and (q_ in new_ or not only_new):
+                        b0_, b1_ = new_.get(q_, (rows[q_][0], rows[q_][1]))
+                        g_a = (a0_ - b0_) + (a1_ - b1_) * s_a
+                        g_b = (a0_ - b0_) + (a1_ - b1_) * s_b
+                        if min(abs(g_a), abs(g_b)) < 0.5 * T or g_a * g_b < 0:
+                            return True
+                return False
+
+            for i_ in sorted(new_):
+                if clash(i_, *new_[i_]):
+                    del new_[i_]
+            # Propagación (ver SLOPE_PROP_MAX_T): una hilera sin rumbo propio
+            # junto a una que lo tomó busca su hilera a una separación de la
+            # recta de la vecina, con una inclinación parecida (a lo sumo
+            # SLOPE_NB_K pasos de diferencia), hasta que no cambie nada.
+            n_first = len(new_)
+            s0_all = [best_in(Q_[n_all], r_[0])[1] for r_ in rows]
+            changed_ = True
+            while changed_:
+                changed_ = False
+                for i_ in range(len(rows)):
+                    if i_ in new_:
+                        continue
+                    for q_ in (i_ - 1, i_ + 1):
+                        if q_ not in new_:
+                            continue
+                        a0q, a1q = new_[q_]
+                        kq = int(round(a1q / d_sg))
+                        xq = a0q + a1q * ic_ + (T if i_ > q_ else -T)
+                        x_, s_, kb_ = None, -np.inf, 0
+                        for kk in range(max(-n_all, kq - SLOPE_NB_K), min(n_all, kq + SLOPE_NB_K) + 1):
+                            xk_, sk_ = best_in(Q_[kk + n_all], xq - (kk - kq) * d_sg * (mid_r[i_] - ic_))
+                            if xk_ is not None and sk_ > s_:
+                                x_, s_, kb_ = xk_, sk_, kk
+                        s0_ = s0_all[i_]
+                        if x_ is None or not np.isfinite(s_) or s_ <= 0:
+                            continue
+                        if np.isfinite(s0_) and s0_ > 0 and s_ < (1.0 + SLOPE_GAIN) * s0_:
+                            continue
+                        line_ = (x_ - kb_ * d_sg * ic_, kb_ * d_sg)
+                        # las vecinas que no tomaron rumbo propio todavía pueden
+                        # tomarlo en esta propagación: no cuentan
+                        if clash(i_, *line_, only_new=True):
+                            continue
+                        new_[i_] = line_
+                        changed_ = True
+                        break
+            info["pendiente_propagada"] = len(new_) - n_first
+            for i_, (a0_, a1_) in new_.items():
+                rows[i_][0], rows[i_][1] = a0_, a1_
+                rows[i_][2], rows[i_][3] = contrast_along(a0_, a1_)
+                info["pendiente_propia"] += 1
+
     # Pasada 2: reubicar el centro de cada hilera por bloques a lo largo de
     # ella, usando SOLO los bloques donde la pasada 1 vio la hilera presente
     # (en un camino o una cabecera no hay hilera, y el "centro" de ese
@@ -1461,9 +1412,15 @@ def detect_rows_by_profile(cv2_module, img, valid, angle_deg, period_px,
     # 4+ bloques se ajusta además una pendiente propia, y solo si es
     # significativa: tolera hileras levemente torcidas o distorsión del
     # ortomosaico sin inventar pendientes a partir del ruido.
+    # Una hilera con rumbo propio (SLOPE_RES) sigue su recta inclinada: la
+    # ventana de cada bloque va donde la recta pasa por el bloque y la recta se
+    # corrige con los centros de los bloques respecto de ella. Con el centro de
+    # la banda (band_on) el centro de cada bloque es el de media altura.
     blk = int(max(10 * T, 60))
     for row, j in zip(rows, centers):
-        a0_1 = row[0]
+        if stop():
+            return [], [], info
+        a0_1, a1_1 = row[0], row[1]
         occ = main_presence(row, tau)
         idx_occ = np.nonzero(occ)[0]
         if len(idx_occ) == 0:
@@ -1481,6 +1438,12 @@ def detect_rows_by_profile(cv2_module, img, valid, angle_deg, period_px,
         pts_s, pts_t = [], []
         for b0 in range(s_lo, s_hi, blk):
             b1 = min(b0 + blk, s_hi)
+            jb = j
+            if a1_1 != 0.0:
+                jb = int(round(a0_1 + a1_1 * 0.5 * (b0 + b1)))
+                jlo, jhi = max(0, jb - half), min(NT, jb + half + 1)
+                if wide_rows:
+                    jlo_w, jhi_w = max(0, jlo - rad_w), min(NT, jhi + rad_w)
             if occ[b0:b1].mean() < 0.5:
                 continue
             c = RV[b0:b1, jlo:jhi].sum(axis=0)
@@ -1498,14 +1461,54 @@ def detect_rows_by_profile(cv2_module, img, valid, angle_deg, period_px,
             a_, b_, c_ = colmean[k - 1], colmean[k], colmean[k + 1]
             den = a_ - 2.0 * b_ + c_
             off = 0.5 * (a_ - c_) / den if abs(den) > 1e-12 else 0.0
+            tk = jlo + k + float(np.clip(off, -0.5, 0.5))
+            if band_on:
+                # perfil del bloque más ancho (±1,5 T), suavizado como el del
+                # lote, para medir la banda a media altura
+                blo, bhi = max(0, jb - int(math.ceil(1.5 * T))), min(NT, jb + int(math.ceil(1.5 * T)) + 1)
+                cb = RV[b0:b1, blo:bhi].sum(axis=0)
+                if cb.min() >= max(3, (b1 - b0) // 4):
+                    smb = np.convolve(np.pad(Rv[b0:b1, blo:bhi].sum(axis=0) / cb, rad, mode="edge"), gk, mode="valid")
+                    hb = half_height_center(smb, jlo + k - blo, T)
+                    if hb is not None and abs(blo + hb - tk) <= BAND_MAX_T * T:
+                        tk = blo + hb
             pts_s.append(0.5 * (b0 + b1))
-            pts_t.append(jlo + k + float(np.clip(off, -0.5, 0.5)))
+            pts_t.append(tk)
         if not pts_t:
             continue
         pts_s, pts_t = np.array(pts_s), np.array(pts_t)
+        if a1_1 != 0.0:
+            # rumbo propio: corrimiento y, si es significativa, pendiente de
+            # los centros de los bloques respecto de la recta inclinada
+            res_ = pts_t - (a0_1 + a1_1 * pts_s)
+            d0_, d1_ = 0.0, 0.0
+            med_ = float(np.median(res_))
+            if abs(med_) <= T / 4.0:
+                d0_ = med_
+            if len(pts_s) >= 4:
+                keep = np.abs(res_ - d0_) <= T / 4.0
+                if keep.sum() >= 4:
+                    ps, pt = pts_s[keep], res_[keep]
+                    A = np.vstack([np.ones(len(ps)), ps]).T
+                    (e0, e1), *_ = np.linalg.lstsq(A, pt, rcond=None)
+                    resid = pt - (e0 + e1 * ps)
+                    sxx = float(((ps - ps.mean()) ** 2).sum())
+                    se_e1 = (math.sqrt(float((resid ** 2).sum()) / (len(ps) - 2) / sxx)
+                             if sxx > 0 and len(ps) > 2 else float("inf"))
+                    mid = 0.5 * (s_lo + s_hi)
+                    if (abs(e1) > 2.0 * se_e1 and abs(e1) * (s_hi - s_lo) <= T / 2.0
+                            and abs(e0 + e1 * mid) <= T / 2.0):
+                        d0_, d1_ = float(e0), float(e1)
+            if d0_ != 0.0 or d1_ != 0.0:
+                row[0], row[1] = a0_1 + d0_, a1_1 + d1_
+                row[2], row[3] = contrast_along(row[0], row[1])
+            continue
+        # con el centro de la banda, la referencia es la posición de la
+        # pasada 1 (ya en el centro), no la columna del pico
+        j_ref = a0_1 if band_on else j
         a0, a1 = a0_1, 0.0
         med = float(np.median(pts_t))
-        if abs(med - j) <= T / 4.0:
+        if abs(med - j_ref) <= T / 4.0:
             a0 = med
         if len(pts_s) >= 4:
             keep = np.abs(pts_t - a0) <= T / 4.0
@@ -1521,7 +1524,7 @@ def detect_rows_by_profile(cv2_module, img, valid, angle_deg, period_px,
                 # derivar hacia la hilera vecina
                 if (abs(c1) > 2.0 * se_c1
                         and abs(c1) * (s_hi - s_lo) <= T / 2.0
-                        and abs(c0 + c1 * mid - j) <= T / 2.0):
+                        and abs(c0 + c1 * mid - j_ref) <= T / 2.0):
                     a0, a1 = float(c0), float(c1)
         if abs(a0 - a0_1) > 1e-6 or a1 != 0.0:
             row[0], row[1] = a0, a1
@@ -1627,6 +1630,8 @@ def detect_rows_by_profile(cv2_module, img, valid, angle_deg, period_px,
     prior_tr = -TRACK_PRIOR * np.abs(lv_ix - TRACK_LEVELS)
     if nb_tr >= 3 and T >= TRACK_MIN_T_PX:
         for row_num, (row, sgn, j) in enumerate(zip(rows, aux_sign, centers), start=1):
+            if stop():
+                return [], [], info
             a0, a1 = row[0], row[1]
             # Solo hileras con pico propio en el perfil que ya se ven sobre su
             # recta (al menos la longitud mínima, con el mismo criterio que
@@ -1669,6 +1674,23 @@ def detect_rows_by_profile(cv2_module, img, valid, angle_deg, period_px,
             row[2], row[3] = contrast_along(a0, a1, dt)
             track[row_num] = dt
             info["seguidas"] += 1
+
+    # Ruido recalculado con las rectas ya ubicadas (rumbo propio, pasada 2,
+    # seguimiento): el de la pasada 1 sale de rectas con el rumbo del lote, que
+    # en hileras levemente inclinadas se salen de la hilera y dan contrastes
+    # negativos que no son ruido (visto: viñedo de la tanda 2, 21 -> 14,7; sus
+    # hileras más tenues quedaban en 1-2 "ruidos" y se cortaban a pedazos).
+    # Solo con las hileras de pico propio, y solo si baja.
+    fin2 = [r_[2][0][np.isfinite(r_[2][0])] for r_, j_ in zip(rows, centers)
+            if j_ not in added and j_ not in grid_added]
+    fin2 = [x_ for x_ in fin2 if x_.size]
+    if fin2:
+        s2_ = noise_rms(np.concatenate(fin2))
+        if 0 < s2_ < sigma:
+            info["sigma_pasada1"] = sigma
+            sigma = s2_
+            tau = k_sigma * sigma
+            info["sigma"], info["tau"] = sigma, tau
 
     # --- 5) tramos por hilera, con umbral por histéresis (como en Canny):
     # un tramo tiene que contener al menos una racha "fuerte" del índice
@@ -1738,6 +1760,8 @@ def detect_rows_by_profile(cv2_module, img, valid, angle_deg, period_px,
                 alt_tol = ALT_TOL
     info["alternadas"] = alt_tol > 0
     for row_num, (row, sgn, j) in enumerate(zip(rows, aux_sign, centers), start=1):
+        if stop():
+            return [], [], info
         a0, a1 = row[0], row[1]
         con_s, dl, dr = row[2][:3]
         cmin = np.minimum(dl, dr)
@@ -1786,6 +1810,11 @@ def detect_rows_by_profile(cv2_module, img, valid, angle_deg, period_px,
             tot_ = sum(se - sa for sa, se in st_)
             if any(se - sa >= min_run for sa, se in st_) or tot_ >= min_run:
                 pieces.append((a, e))
+            elif (e - a >= WEAK_SEED_T * T
+                  and float(np.mean(np.clip(ev[a:e], -5.0, 20.0))) >= WEAK_SEED_M):
+                # evidencia débil pero sostenida (ver WEAK_SEED_T)
+                pieces.append((a, e))
+                info["sembradas_debiles"] = info.get("sembradas_debiles", 0) + 1
             elif tot_ >= 3:
                 cand.append((a, e))
         # Rachas débiles con algo de evidencia fuerte, a menos del hueco
@@ -2127,14 +2156,78 @@ def detect_rows_by_profile(cv2_module, img, valid, angle_deg, period_px,
     info["n_hileras"] = len(centers) - len(grid_added) + grid_with
 
     regularize_row_ends(row_iv, T, info, tails=tails)
+    fill_by_neighbors(row_iv, rows, T, sigma, info)
+    cut_aligned_gaps(row_iv, rows, T, NS, info)
     # diagnóstico: posición perpendicular (px de img, t = -x*sin + y*cos del
     # ángulo) de cada hilera ubicada, y cuáles tienen tramos
     info["filas_t"] = [t0 + row[0] for row in rows]
     info["filas_con_tramos"] = sorted(r[0] for r in row_iv)
 
     info["tramos_reajustados"] = 0
+    # Línea de salida al centro a media altura de la banda (ver HALF_MIN_T).
+    # El perfil a lo ancho de cada hilera se toma siguiendo su propia recta (y
+    # el camino seguido) solo donde tiene tramos: el perfil de columnas de todo
+    # el lote borronea la forma de la banda en hileras largas (corría 0,15 m
+    # donde hacían falta 0,9 m).
+    hc_shift = {}
+    if half_center:
+        step_o = 0.25
+        oo = np.arange(-T, T + 1e-9, step_o)
+        sig_o = max(1.0, (T / 16.0) / step_o)
+        rk = int(math.ceil(3 * sig_o))
+        gko = np.exp(-0.5 * (np.arange(-rk, rk + 1) / sig_o) ** 2)
+        gko /= gko.sum()
+        c0i = len(oo) // 2
+        w4 = int(math.ceil((T / 4.0) / step_o))
+        for row_num, a0, a1, intervals in row_iv:
+            if not intervals:
+                continue
+            sidx = np.concatenate([np.arange(max(0, int(i1)), min(NS - 1, int(i2)) + 1) for i1, i2 in intervals])
+            if len(sidx) < 3 * T:
+                continue
+            dtr = track.get(row_num)
+            tt = a0 + a1 * sidx + (dtr[sidx] if dtr is not None else 0.0)
+            cc = tt[:, None] + oo[None, :]
+            k0 = np.floor(cc).astype(np.int64)
+            fr = cc - k0
+            okc = (k0 >= 0) & (k0 + 1 < NT)
+            k0c = np.clip(k0, 0, NT - 2)
+            s_ = sidx[:, None]
+            okc &= RV[s_, k0c] & RV[s_, k0c + 1]
+            cnt_ = okc.sum(axis=0)
+            if cnt_.min() < 0.5 * len(sidx):
+                continue
+            vv = R[s_, k0c] * (1 - fr) + R[s_, k0c + 1] * fr
+            pr = np.where(okc, vv, 0.0).sum(axis=0) / np.maximum(cnt_, 1)
+            pr = np.convolve(np.pad(pr, rk, mode="edge"), gko, mode="valid")
+            k_ = c0i - w4 + int(np.argmax(pr[c0i - w4:c0i + w4 + 1]))
+            if not 0 < k_ < len(pr) - 1:
+                continue
+            hc = half_height_center(pr, k_, T / step_o)
+            if hc is None:
+                continue
+            # la asimetría de la banda: cuánto se aparta su centro a media
+            # altura de su punto más oscuro (sub-muestra). La línea se corre eso
+            # mismo: medido desde la línea (y no desde el pico) corría menos y
+            # quedaba más lejos de la corrección a mano (F1 0,595 -> 0,543 y
+            # 0,793 -> 0,779 en los dos viñedos)
+            a_, b_, c_ = pr[k_ - 1], pr[k_], pr[k_ + 1]
+            den = a_ - 2.0 * b_ + c_
+            pk = k_ + (float(np.clip(0.5 * (a_ - c_) / den, -0.5, 0.5)) if abs(den) > 1e-12 else 0.0)
+            hc_shift[row_num] = float(np.clip((hc - pk) * step_o, -HALF_MAX_T * T, HALF_MAX_T * T))
+        # un solo corrimiento para todo el lote (la sombra cae siempre del
+        # mismo lado), solo si es claro y casi todas las hileras lo comparten
+        vals = np.array(list(hc_shift.values()))
+        med = float(np.median(vals)) if len(vals) >= 5 else 0.0
+        same = float(np.mean(np.sign(vals) == np.sign(med))) if len(vals) else 0.0
+        if abs(med) >= HALF_MIN_T * T and same >= HALF_SAME:
+            hc_shift = {k_: med for k_ in hc_shift}
+            info["centro_media_altura"] = med
+        else:
+            hc_shift = {}
     for row_num, a0, a1, intervals in row_iv:
         dt = track.get(row_num)
+        a0 = a0 + hc_shift.get(row_num, 0.0)
         for i1, i2 in intervals:
             # la alineación de extremos puede llevar una punta a la
             # prolongación del borde de las vecinas, fuera de la grilla
@@ -2157,6 +2250,220 @@ def detect_rows_by_profile(cv2_module, img, valid, angle_deg, period_px,
             row_ids.append(row_num)
 
     return segments, row_ids, info
+
+
+def half_height_center(p, k, T):
+    """Centro a media altura del pico k del perfil p (T en muestras de p):
+    punto medio entre los dos cruces del nivel (pico + fondo)/2, con el fondo
+    = media de los mínimos a cada lado dentro de ±0,9 T (la franja clara de un
+    lado puede quedar a más de T/2 del pico si la banda es asimétrica). None
+    si no cruza a ambos lados."""
+    n = len(p)
+    h = max(2, int(round(0.9 * T)))
+    lo, hi = max(0, k - h), min(n - 1, k + h)
+    if k - lo < 1 or hi - k < 1:
+        return None
+    base = 0.5 * (float(p[lo:k].min()) + float(p[k + 1:hi + 1].min()))
+    lev = 0.5 * (float(p[k]) + base)
+    i = k
+    while i > lo and p[i] >= lev:
+        i -= 1
+    if p[i] >= lev:
+        return None
+    xl = i + (lev - p[i]) / (p[i + 1] - p[i])
+    i = k
+    while i < hi and p[i] >= lev:
+        i += 1
+    if p[i] >= lev:
+        return None
+    xr = (i - 1) + (p[i - 1] - lev) / (p[i - 1] - p[i])
+    return 0.5 * (xl + xr)
+
+
+# Relleno con las vecinas: una hilera que se ve de punta a punta pero más
+# tenue que sus vecinas (en la tanda 2, hileras a 1-3 ruidos entre vecinas a
+# 10-14) salía con huecos de 10-30 m o le faltaba una punta entera. Donde sus
+# DOS vecinas tienen línea (al menos NB_COVER del tramo), un hueco interno de la
+# hilera, o una punta que le falta (al menos NB_END_T separaciones), se
+# completa si ahí la hilera sigue siendo más oscura que sus dos entrehileras en
+# al menos NB_POS del tramo, con contraste mediano >= NB_EV ruidos. Donde la
+# sombra de una fila de árboles o una reguera cortan la hilera, cortan también
+# a las vecinas: eso no se rellena.
+NB_COVER = 0.9
+NB_POS = 0.6
+NB_EV = 0.5
+NB_END_T = 3.0
+
+
+def fill_by_neighbors(row_iv, rows, T, sigma, info):
+    """Completa en el lugar los huecos y puntas faltantes de cada hilera de
+    row_iv donde sus dos vecinas (números de hilera ±1) tienen línea (ver
+    NB_COVER). rows: filas de detect_rows_by_profile (row[2][:3] =
+    contrastes con las entrehileras); sigma: ruido del contraste."""
+    info["rellenos_vecinas"] = 0
+    by_rn = {r_[0]: r_[3] for r_ in row_iv}
+
+    def covered(ivs, a, e):
+        """Fracción de [a, e] cubierta por los tramos ivs."""
+        if e <= a:
+            return 1.0
+        return sum(max(0.0, min(e, i2) - max(a, i1)) for i1, i2 in ivs) / (e - a)
+
+    def weak_ok(rn, a, e):
+        """¿La hilera rn sigue más oscura que sus entrehileras en [a, e]?"""
+        con, dl, dr = rows[rn - 1][2][:3]
+        sl = slice(int(max(a, 0)), int(e) + 1)
+        c_, m_ = con[sl], np.minimum(dl[sl], dr[sl])
+        ok = np.isfinite(c_)
+        if ok.sum() < 0.5 * max(1, len(c_)):
+            return False
+        return (float(np.mean(m_[ok] > 0)) >= NB_POS
+                and float(np.median(c_[ok])) / max(sigma, 1e-12) >= NB_EV)
+
+    new_all = {}
+    for k, (rn, a0, a1, ivs) in enumerate(row_iv):
+        nb = [by_rn.get(rn - 1), by_rn.get(rn + 1)]
+        if any(v is None for v in nb):
+            continue
+        merged = [[x[0], x[1]] for x in ivs[:1]]
+        for i1, i2 in ivs[1:]:
+            a, e = merged[-1][1], i1
+            if all(covered(v, a, e) >= NB_COVER for v in nb) and weak_ok(rn, a, e):
+                merged[-1][1] = i2
+                info["rellenos_vecinas"] += 1
+            else:
+                merged.append([i1, i2])
+        st = max(v[0][0] for v in nb)   # hasta donde llegan las dos vecinas
+        if (merged[0][0] - st >= NB_END_T * T and all(covered(v, st, merged[0][0]) >= NB_COVER for v in nb)
+                and weak_ok(rn, st, merged[0][0])):
+            merged[0][0] = float(st)
+            info["rellenos_vecinas"] += 1
+        en = min(v[-1][1] for v in nb)
+        if (en - merged[-1][1] >= NB_END_T * T and all(covered(v, merged[-1][1], en) >= NB_COVER for v in nb)
+                and weak_ok(rn, merged[-1][1], en)):
+            merged[-1][1] = float(en)
+            info["rellenos_vecinas"] += 1
+        new_all[k] = merged
+    for k, merged in new_all.items():
+        rn, a0, a1, _ = row_iv[k]
+        row_iv[k] = (rn, a0, a1, merged)
+
+
+# Cortes transversales: una reguera, acequia o camino angosto que cruza las
+# hileras en diagonal deja en cada hilera un hueco de 2-5 m que la histéresis
+# une (como una planta faltante) y la línea lo atravesaba (visto: viñedo de la
+# tanda 2 partido por una reguera; el usuario corta las líneas a los dos lados).
+# Los huecos de una reguera caen todos sobre una misma recta que atraviesa
+# muchas hileras; los de plantas faltantes, sueltos. Se buscan rectas de huecos
+# (contraste a escala de planta < 0, de al menos T/3) que junten al menos
+# CUT_MIN_ROWS hileras y al menos CUT_FRAC de las hileras que la recta cruza
+# (pendiente |ds/dt| <= CUT_M_MAX: no casi paralela a las hileras; hasta
+# CUT_MAX_LINES rectas por lote), y ahí se cortan las líneas. Solo cuentan
+# hileras casi continuas (huecos < CUT_MAX_GAPFRAC del largo): en un frutal de
+# árboles sueltos los huecos entre árboles también se alinean, pero son la
+# mitad de la hilera.
+CUT_MIN_ROWS = 8
+CUT_FRAC = 0.5
+CUT_MAX_GAPFRAC = 0.15
+CUT_M_MAX = 4.0
+CUT_MAX_LINES = 5
+
+
+def cut_aligned_gaps(row_iv, rows, T, NS, info):
+    """Corta los tramos de row_iv (en el lugar) en los huecos alineados de
+    un corte transversal (ver CUT_MIN_ROWS). rows: filas de
+    detect_rows_by_profile (row[2][3] = contraste a escala de planta)."""
+    info["cortes_transversales"] = 0
+    gaps = []   # (índice en row_iv, t, s, inicio, fin) de cada hueco
+    for k, (rn, a0, a1, ivs) in enumerate(row_iv):
+        pl = rows[rn - 1][2][3]
+        tot, rg = 0.0, []
+        for i1, i2 in ivs:
+            i1, i2 = int(max(i1, 0)), int(min(i2, NS - 1))
+            m = np.nan_to_num(pl[i1:i2 + 1], nan=0.0) < 0
+            d = np.diff(np.r_[0, m.astype(np.int8), 0])
+            for a, e in zip(np.nonzero(d == 1)[0], np.nonzero(d == -1)[0]):
+                tot += e - a
+                if e - a >= T / 3.0:
+                    sm = i1 + 0.5 * (a + e)
+                    rg.append((k, a0 + a1 * sm, sm, i1 + a, i1 + e - 1))
+        L = sum(i2 - i1 for i1, i2 in ivs)
+        if L > 0 and tot <= CUT_MAX_GAPFRAC * L:
+            gaps += rg
+    if len(gaps) < CUT_MIN_ROWS:
+        return
+    G = np.array(gaps)
+    t_rows = np.array([a0 + a1 * 0.5 * (ivs[0][0] + ivs[-1][1]) for _, a0, a1, ivs in row_iv])
+    span = max(float(np.ptp(t_rows)), T)
+    # pendientes de a T/4 de diferencia a lo ancho de todo el lote
+    ms = np.arange(-CUT_M_MAX, CUT_M_MAX + 1e-9, 0.25 * T / span)
+    used = np.zeros(len(G), bool)
+    cuts = {}   # índice en row_iv -> [(inicio, fin)]
+    ub = None   # por pendiente: el mejor conteo de una vuelta anterior (cota superior)
+    for _ in range(CUT_MAX_LINES):
+        idx = np.nonzero(~used)[0]
+        if len(idx) < CUT_MIN_ROWS or len(ms) == 0:
+            break
+        g_t, g_s = G[idx, 1], G[idx, 2]
+        ar_ = np.arange(len(idx))
+
+        def best_at(m, g_t=g_t, g_s=g_s, ar_=ar_):
+            """Más huecos a menos de T/2 de una recta de pendiente m (barrido
+            de b): (cuántos, b de la recta)."""
+            bs = np.sort(g_s - m * g_t)
+            cnt = np.searchsorted(bs, bs + T, side="right") - ar_
+            q = int(np.argmax(cnt))
+            return int(cnt[q]), bs[q] + 0.5 * T
+
+        # recta s = m t + b con más huecos: la primera pendiente con el máximo
+        if ub is None:
+            found = [best_at(m) for m in ms]
+            ub = np.array([n for n, _ in found])
+            k_best = int(np.argmax(ub))
+            n_, b = found[k_best]
+        else:
+            # En las vueltas siguientes solo se sacaron huecos (los de la recta
+            # anterior), así que el conteo de cada pendiente solo pudo bajar: el
+            # de antes es una cota superior. Se recalculan de mayor a menor cota
+            # hasta que ninguna de las que quedan puede alcanzar al mejor; el
+            # resultado es el mismo que barriendo todas (antes, cinco barridos
+            # completos por lote: una cuarta parte del tiempo en un lote de 400
+            # hileras).
+            n_, k_best, b = 0, None, None
+            for k in np.argsort(-ub, kind="stable"):
+                if ub[k] < n_:
+                    break
+                nk, bk = best_at(ms[k])
+                ub[k] = nk
+                if nk > n_ or (nk == n_ and k < k_best):
+                    n_, k_best, b = nk, int(k), bk
+        m = ms[k_best]
+        if n_ < CUT_MIN_ROWS:
+            break
+        sup = idx[np.abs(g_s - (m * g_t + b)) <= 0.5 * T]
+        rows_sup = set(G[sup, 0].astype(int))
+        crossed = 0
+        for k, (rn, a0, a1, ivs) in enumerate(row_iv):
+            s_ = m * (a0 + a1 * 0.5 * (ivs[0][0] + ivs[-1][1])) + b
+            if any(i1 <= s_ <= i2 for i1, i2 in ivs) or k in rows_sup:
+                crossed += 1
+        used[sup] = True
+        if len(rows_sup) < CUT_MIN_ROWS or len(rows_sup) < CUT_FRAC * crossed:
+            continue
+        info["cortes_transversales"] += 1
+        for g in G[sup]:
+            cuts.setdefault(int(g[0]), []).append((g[3], g[4]))
+    for k, cl in cuts.items():
+        rn, a0, a1, ivs = row_iv[k]
+        for a, e in cl:
+            new = []
+            for i1, i2 in ivs:
+                if i1 < a and e < i2:
+                    new += [[i1, a - 1.0], [e + 1.0, i2]]
+                else:
+                    new.append([i1, i2])
+            ivs = new
+        row_iv[k] = (rn, a0, a1, ivs)
 
 
 def regularize_row_ends(row_iv, T, info=None, n_neighbors=4, tails=None):
@@ -2313,39 +2620,21 @@ class DetectCropRowsAlgorithm(QgsProcessingAlgorithm):
     RED_BAND = "RED_BAND"
     GREEN_BAND = "GREEN_BAND"
     BLUE_BAND = "BLUE_BAND"
-    METHOD = "METHOD"
-    VEG_INDEX = "VEG_INDEX"
     ROW_SPACING = "ROW_SPACING"
     SENSITIVITY = "SENSITIVITY"
     CONTOUR = "CONTOUR"
     AUTO_BLOCKS = "AUTO_BLOCKS"
     OUT_BLOCKS = "OUT_BLOCKS"
+    DETECT_FAILURES = "DETECT_FAILURES"
+    FAIL_THRESHOLD = "FAIL_THRESHOLD"
+    FAIL_MIN_LEN = "FAIL_MIN_LEN"
+    OUT_FAILURES = "OUT_FAILURES"
     EXTEND_MAX = "EXTEND_MAX"
-    THRESHOLD = "THRESHOLD"
-    MIN_LINE_LENGTH = "MIN_LINE_LENGTH"
-    MAX_LINE_GAP = "MAX_LINE_GAP"
-    HOUGH_THRESHOLD = "HOUGH_THRESHOLD"
-    CLOSING_PX = "CLOSING_PX"
-    FILTER_ANGLE = "FILTER_ANGLE"
-    ANGLE_FILTER_TOL = "ANGLE_FILTER_TOL"
-    MERGE_LINES = "MERGE_LINES"
-    MERGE_ANGLE_TOL = "MERGE_ANGLE_TOL"
-    MERGE_DIST_TOL = "MERGE_DIST_TOL"
-    MERGE_MAX_GAP = "MERGE_MAX_GAP"
-    MERGE_MAX_LENGTH = "MERGE_MAX_LENGTH"
-    CALC_COVERAGE = "CALC_COVERAGE"
-    COVERAGE_WIDTH = "COVERAGE_WIDTH"
-    CALC_PLANT_COUNT = "CALC_PLANT_COUNT"
-    MIN_PLANT_AREA = "MIN_PLANT_AREA"
+    MIN_LENGTH_M = "MIN_LENGTH_M"
+    MAX_GAP_M = "MAX_GAP_M"
     SPACING_FIELD = "SPACING_FIELD"
     STRIPE = "STRIPE"
     OUTPUT = "OUTPUT"
-
-    METHOD_PROFILE = 0
-    METHOD_HOUGH = 1
-
-    INDEX_EXG_CHROMATIC = 0
-    INDEX_EXG_RAW = 1
 
     # Qué franja es la hilera (método de perfil)
     STRIPE_AUTO = 0      # la más verde, salvo copa cerrada (ver _detect_rows_profile)
@@ -2377,8 +2666,16 @@ class DetectCropRowsAlgorithm(QgsProcessingAlgorithm):
     # promedio); viñedos y frutales con hoja 0,04-0,44; frutal en seto con la
     # sombra al costado 0,27. Corrimiento (en pasos de T/12): viñedos 0-1
     # paso, el seto 2 pasos (0,17), frutal joven con sombra y pasto 3 pasos.
+    # Vuelo de dron (0,05 m/px) sobre un viñedo con hojas: canopia angosta y
+    # verde con su sombra negra al costado (verdor 0,086, corrimiento 0,25):
+    # con el límite en 0,10 caía en la zona gris y las líneas iban a la
+    # sombra (0,65 m de la vid); con 0,06 sigue con el verdor, y la sombra se
+    # declara como tal para que la reubicación por brillo no lleve las hileras
+    # a ella (sin eso, 53 de 108 terminaban en la sombra). Los frutales
+    # jóvenes con cobertura (0,02-0,03) siguen en la zona gris. Ninguno de los
+    # 32 lotes de prueba cambia.
     C_NOT_GREEN = 0.0
-    C_GREEN_CANOPY = 0.10
+    C_GREEN_CANOPY = 0.06
     DARK_OFFSET_MAX = 0.15
     # Copa cerrada: separación mínima de frutal, verdor mínimo de la franja
     # a media separación (fracción del de la más verde) y cuánto más verde
@@ -2431,6 +2728,17 @@ class DetectCropRowsAlgorithm(QgsProcessingAlgorithm):
     # prueba separa limpio los lotes con canopia poco verde (3,7-6,5) de
     # los normales (0,8-2,9).
     BRIGHTNESS_SWITCH = 3.0
+    # Centro de la banda (ver BAND_MAX_T): mejora mínima del largo de hilera
+    # presente para usarlo, según por qué se eligió la franja oscura. Canopia
+    # nada verde (vid sin hojas): lo más oscuro suele ser la sombra, 25% (en la
+    # tanda 2 los viñedos que ganan dan 33-124%; uno que daba 13% perdía un
+    # poco). Brillo mucho más marcado que el verdor: la canopia puede ser verde
+    # y oscura y el usuario marca lo más oscuro (frutal y viñedo de la tanda 1:
+    # 16% y 0%, y el centro los empeoraba), 50%; el hortícola en camellones da
+    # 138%. Canopia apenas verde (zona gris): no se usa (un frutal con 74%
+    # empeoraba: ahí la copa, algo verde, es lo más oscuro).
+    BAND_GAIN_NOT_GREEN = 0.25
+    BAND_GAIN_BRIGHT = 0.5
     # Hileras sobre el borde del contorno, en fracciones de la separación T
     # y solo A LO ANCHO de las hileras (a lo largo, el contorno se respeta
     # estricto): una hilera cuyo eje queda hasta 0,4 T afuera del contorno es
@@ -2438,6 +2746,10 @@ class DetectCropRowsAlgorithm(QgsProcessingAlgorithm):
     # conserva; la siguiente hacia afuera estaría a más de 0,5 T y no entra.
     # Para medir su contraste se muestrea hasta 1 T afuera (su entrehilera
     # exterior).
+    # Largo mínimo de un tramo y hueco máximo dentro de una hilera (m): los
+    # valores con que se ajustaron las tandas de prueba (Google, 0,125 m/px).
+    MIN_LENGTH_M_DEF = 6.25
+    MAX_GAP_M_DEF = 7.5
     ROW_TOL = 0.4
     SAMPLE_TOL = 1.0
 
@@ -2470,594 +2782,225 @@ class DetectCropRowsAlgorithm(QgsProcessingAlgorithm):
         return "crop_row_detector"
 
     def shortHelpString(self):
+        # Guía de uso: cada renglón es un párrafo en el panel de ayuda. El
+        # detalle técnico está en el README; la explicación de cada parámetro,
+        # en su ayuda emergente (initAlgorithm).
         return self.tr(
-            "Detecta hileras de cultivo en un raster (ortomosaico RGB) sin "
-            "necesidad de entrenar un modelo. Usa el índice ExG cromático "
-            "(2G-R-B)/(R+G+B), que mide qué tan verde es cada píxel "
-            "independientemente de su brillo, y georreferencia el resultado "
-            "automáticamente. Los píxeles transparentes o nodata (p. ej. "
-            "fuera del recorte de la parcela) se ignoran.\n\n"
-            "Cuarteles: sin capa de contorno (y con el método de perfil), primero se "
-            "detectan los cuarteles de la imagen: son las zonas con un patrón de hileras "
-            "(periodicidad), no cualquier zona verde; el monte, el pasto o los caminos no "
-            "cuentan, y las calles separan un cuartel de otro. Cada cuartel estima después "
-            "su propio rumbo y su propia distancia entre hileras, así que cuarteles con "
-            "otro rumbo o con otra separación se resuelven por separado. Busca hileras de "
-            "1 a 8 m; la capa opcional de cuarteles permite revisarlos.\n\n"
-            "Extremos de hilera: cada hilera termina donde termina lo "
-            "plantado, sin entrar en la calle de cabecera. Los extremos que "
-            "se apartan del borde que forman las hileras vecinas (más de "
-            "media separación entre hileras, hasta 3 separaciones) se "
-            "alinean con ese borde; donde hay un escalón real (un rincón sin "
-            "plantar) no se tocan. Las plantas chicas de la punta (replantes, "
-            "menor vigor) se incluyen: la hilera se prolonga planta por planta "
-            "mientras haya plantas a menos de una separación entre hileras una "
-            "de otra; un árbol aislado más lejos, en la cabecera, no se une. "
-            "Una punta separada del resto por una o dos plantas débiles o "
-            "faltantes se suma si no pasa del borde que forman las hileras "
-            "vecinas.\n\n"
-            "Frutal en marco (árboles sueltos alineados en dos direcciones): se "
-            "toma como hileras la alineación de mayor separación, mirando el "
-            "verdor y el brillo (en un olivar las hileras solo se veían en el "
-            "brillo), o, si se indica la 'Distancia entre hileras', la más "
-            "fuerte a ±10% de ese valor; el log muestra las dos. Con pasto "
-            "verde entre árboles sueltos no se aplica copa cerrada.\n\n"
-            "REVISAR: cuando una decisión automática queda con poco margen, el "
-            "log lo avisa en rojo al final de cada lote y cada línea lleva el "
-            "motivo en el campo 'revisar' (vacío = sin dudas): 'rumbo' (marco "
-            "casi cuadrado o periodicidad débil), 'franja' (la franja más verde "
-            "y la más oscura están en lugares distintos y la elección quedó "
-            "cerca del límite, o se aplicó copa cerrada), 'cobertura' (menos "
-            "del 70% de las hileras ubicadas tienen línea) o 'cuadros' (en parte "
-            "del lote las hileras van a otra separación: dividilo en un polígono "
-            "por cuadro de plantación). Coloreá la capa por "
-            "ese campo y mirá esos lotes sobre la imagen.\n\n"
-            "Hileras de borde y plantas chicas: las posiciones del marco de "
-            "plantación se prueban en el múltiplo exacto de la separación, y un "
-            "tramo de plantas chicas o ralas (más oscuro que la entrehilera, "
-            "dentro del largo de las hileras vecinas) se conserva aunque su "
-            "nivel promedio sea bajo.\n\n"
-            "Hileras levemente torcidas: cada hilera se sigue de costado hasta "
-            "0,3 separaciones (y no más de 0,6 m) para medirla aunque se "
-            "aparte de su recta; la salida sigue siendo una recta por tramo.\n\n"
-            "Importante: las líneas nunca salen del polígono del lote. Si el "
-            "borde de cabecera pasa antes de la última planta, la hilera "
-            "termina en ese borde: dibujá la cabecera sobre la calle.\n\n"
-            "Contorno de la parcela o lotes (opcional): las líneas se "
-            "recortan a estos polígonos, estrictamente a lo largo de las "
-            "hileras. A lo ancho, una hilera dibujada sobre el borde del "
-            "polígono (o hasta 0,4 separaciones afuera) es la hilera de borde "
-            "del lote y se conserva entera; su entrehilera exterior se usa "
-            "para medirla. El polígono puede tomar parte de la calle (hasta "
-            "su eje): cada hilera igual termina donde terminan las plantas, y "
-            "los tramos sin el nivel de una hilera (huellas de tractor, "
-            "sombras) se descartan; sí conviene dejar afuera cortinas "
-            "rompevientos y árboles en fila. Si no se da contorno, se usa el "
-            "área con datos del raster. Con el método de perfil, cada polígono "
-            "(uno por lote; también si hay uno solo) se procesa por separado, "
-            "solo con sus píxeles, con su propia orientación, separación, "
-            "alineación de hileras y numeración (campo 'lote'): así funcionan "
-            "escenas con varios lotes, calles entre ellos o cultivos "
-            "distintos (viñedo, frutal, hortaliza), y las calles entre lotes "
-            "quedan afuera. Una hilera de borde tiene que estar en el marco de "
-            "plantación (a un múltiplo de la separación de las hileras "
-            "interiores): un cerco o una fila de árboles a lo largo del borde "
-            "no se toma como hilera. "
-            "'Extender hasta el contorno' (default 0) "
-            "prolonga cada hilera hasta el borde del contorno si le faltan "
-            "como máximo esos metros: usalo solo si el contorno es el del "
-            "área plantada; con el contorno del lote, las líneas "
-            "atravesarían las calles.\n\n"
-            "MÉTODO 'Perfil de proyección' (default): pensado para hileras "
-            "rectas y paralelas (viñedo, frutal, cultivos en línea). Mide "
-            "la orientación y la separación de las hileras con la FFT 2D "
-            "del ExG, ubica el centro de cada hilera con el perfil "
-            "perpendicular, y a lo largo de cada hilera marca los tramos "
-            "donde la hilera es más verde que las dos entrehileras vecinas "
-            "(contraste local, independiente del vigor absoluto de la "
-            "zona). Donde el verdor se debilita (vides de menor vigor, pasto "
-            "en la entrehilera, plantas de borde) la hilera se sigue "
-            "mientras continúe su patrón de brillo (franja más oscura o más "
-            "clara que ambas entrehileras, con el mismo signo que en el resto "
-            "de la hilera). El brillo también controla la posición: si en "
-            "un lote la canopia no es verde en la imagen (sin hojas, de otoño, "
-            "rojiza: la franja 'más verde' es solo la menos rojiza, a menudo el "
-            "suelo), las hileras se ubican como las franjas oscuras (el log lo "
-            "avisa); si el brillo es más fuerte pero la canopia es verde y la "
-            "franja oscura está corrida de ella, la oscura es la sombra y se "
-            "usa la más verde; y si en "
-            "una franja del lote la entrehilera es más verde que la hilera "
-            "(pasto entre hileras), los centros se reubican sobre la franja "
-            "oscura. Como el marco de plantación es regular, también se "
-            "prueba cada posición a un múltiplo de la separación de las "
-            "hileras ubicadas, aunque el perfil no muestre ahí una hilera: "
-            "así aparecen hileras de plantas chicas o ralas (típicamente la "
-            "de borde); en una calle o en suelo desnudo no se marca nada.\n\n"
-            "Otros cultivos: en un frutal de copa cerrada (sin suelo entre "
-            "hileras) la franja más verde es la sombra entre copas; el "
-            "complemento lo reconoce y ubica las hileras sobre las copas "
-            "iluminadas (el log lo avisa; 'Franja de la hilera' permite "
-            "forzar el criterio). Con hileras finas (hortalizas, < 1 m) la "
-            "separación se busca en el espectro blanqueado (un manchón de "
-            "vigor grande no la tapa) y, si las hileras están al límite de la "
-            "resolución, se marcan donde el patrón de varias hileras vecinas "
-            "es claro (modo patrón: posición correcta, extremos aproximados, "
-            "sin fallas de plantas; el log lo avisa). "
-            "Da una línea por tramo continuo de hilera, con "
-            "el campo 'hilera' numerando cada hilera en orden. No usa bordes ni "
-            "Hough, así que no sufre el problema de líneas que cruzan las "
-            "hileras cuando éstas son angostas y están muy juntas. El log "
-            "muestra el rumbo detectado, la separación entre hileras y "
-            "cuántas se encontraron.\n\n"
-            "  - 'Distancia entre hileras' (default -1 = automático): solo "
-            "hace falta si el rumbo o la separación detectados en el log "
-            "son incorrectos (p. ej. si la distancia entre plantas a lo "
-            "largo de la hilera genera una periodicidad más fuerte que la "
-            "de las hileras). Con un valor aproximado alcanza.\n"
-            "  - 'Campo de distancia entre hileras por lote' (opcional): un "
-            "campo numérico de la capa de lotes con la distancia de cada lote "
-            "en metros; donde es > 0 reemplaza a la distancia general. Sirve "
-            "para correr juntos cultivos de separación muy distinta.\n"
-            "  - 'Franja de la hilera' (avanzado): Automático, Franja más "
-            "verde (viñedos y frutales con suelo entre hileras), Copas "
-            "iluminadas (frutal de copa cerrada) o Franja oscura (canopia poco "
-            "verde o rojiza sobre suelo claro).\n"
-            "  - 'Longitud mínima de línea' y 'Espacio longitudinal máximo' "
-            "se usan también en este método: tramos más cortos que la "
-            "longitud mínima se descartan, y huecos (plantas faltantes) de "
-            "hasta el espacio longitudinal máximo se unen.\n"
-            "  - 'Sensibilidad' (avanzado, default 3): umbral de contraste "
-            "en múltiplos del ruido. Bajalo si faltan tramos de hileras "
-            "débiles; subilo si aparecen tramos sobre cosas que no son "
-            "hileras.\n"
-            "Limitación: sin polígonos de lote, supone un único lote (una "
-            "orientación y una alineación de hileras) por raster. Si la "
-            "escena tiene varios lotes o cultivos, dibujá un polígono por "
-            "lote en la capa de contorno.\n\n"
-            "MÉTODO 'Canny + Hough' (anterior): binariza, detecta bordes con "
-            "Canny y ajusta líneas rectas con la Transformada de Hough "
-            "probabilística. Sus parámetros específicos están en "
-            "'Parámetros avanzados'. Funciona con franjas de vegetación "
-            "anchas y bien separadas; con hileras angostas y juntas "
-            "(menos de ~15 px de período) tiende a detectar líneas que "
-            "cruzan las hileras.\n\n"
-            "Consejo (Hough): si las hileras salen muy fragmentadas, subí "
-            "'Distancia máxima entre segmentos' (max_line_gap). Si aparecen "
-            "líneas espurias, subí 'Umbral de Hough' o 'Longitud mínima'.\n\n"
-            "Cierre morfológico (Hough, viñedo/frutal): si el cultivo son plantas "
-            "individuales bien separadas entre sí (no una franja continua), "
-            "Canny va a detectar el contorno de cada planta por separado, en "
-            "todas direcciones, en vez de un borde de hilera continuo. Subir "
-            "este parámetro (probá 3-7 px) une plantas cercanas en blobs más "
-            "continuos antes de Canny y reduce ese ruido direccional.\n\n"
-            "Filtro de dirección dominante (Hough): antes de fusionar, detecta "
-            "automáticamente la orientación predominante entre todos los "
-            "segmentos (ponderada por longitud) y descarta los que no estén "
-            "cerca de esa dirección. Es clave cuando el cultivo tiene plantas "
-            "individuales (viñedo/frutal): el contorno de cada planta genera "
-            "segmentos en direcciones dispersas que, sin este filtro, "
-            "contaminan la fusión y producen una maraña de líneas cruzadas "
-            "en vez de hileras limpias. Si el mensaje de 'concentración' sale "
-            "muy bajo, no hay una dirección clara — el ángulo detectado puede "
-            "ser incorrecto; conviene revisar visualmente el resultado.\n\n"
-            "Fusión de segmentos (Hough): con 'Fusionar segmentos' activado, los "
-            "tramos de Hough que comparten ángulo (dentro de la tolerancia), "
-            "están cerca perpendicularmente y cerca a lo largo de la hilera "
-            "se combinan en una sola línea por hilera, ajustada por PCA y "
-            "extendida al alcance real de todos sus segmentos.\n\n"
-            "  - 'Distancia perpendicular máxima' (default -1 = automático): "
-            "qué tan cerca de costado tienen que estar dos segmentos para "
-            "fusionarse. El automático mide la separación real entre "
-            "hileras vecinas a partir de los segmentos detectados y usa el "
-            "40% de esa distancia — pensado para hileras muy juntas "
-            "(viñedo/frutal de alta densidad), donde un valor fijo grande "
-            "termina fusionando varias hileras vecinas en una sola.\n\n"
-            "  - 'Espacio longitudinal máximo' (default 60 px): la "
-            "salvaguarda más importante. Espacio máximo, medido A LO LARGO "
-            "de la hilera (no de costado), entre el tramo ya fusionado y el "
-            "próximo segmento candidato. Sin este chequeo, dos segmentos con "
-            "ángulo y distancia perpendicular parecidos se fusionan aunque "
-            "estén a cientos de píxeles de distancia entre sí a lo largo de "
-            "la hilera — con un camino, un límite de parcela, o cualquier "
-            "zona sin relación en el medio — incluso en un campo con una "
-            "única dirección real consistente en toda la escena. Es la "
-            "causa más común de líneas absurdamente largas que cruzan zonas "
-            "sin relación entre sí. Subilo solo si tus hileras tienen huecos "
-            "reales (plantas faltantes) más largos que el default.\n\n"
-            "  - 'Longitud máxima de fusión' (default -1 = sin límite, en "
-            "metros): tope duro adicional a cuánto puede crecer una hilera "
-            "fusionada en total. Ya no suele hacer falta si el espacio "
-            "longitudinal máximo está bien calibrado, pero sirve como límite "
-            "absoluto extra si conocés la longitud real máxima de tus "
-            "hileras.\n\n"
-            "% de cobertura (opcional): mide, dentro de una franja cultivable "
-            "alrededor de cada hilera (excluyendo calles/pasillos), qué "
-            "porcentaje de esa franja es vegetación según la máscara ExG. "
-            "El ancho de la franja puede ser automático (mitad de la distancia "
-            "a la hilera vecina) o manual en metros; el automático no distingue "
-            "calles de tránsito bien anchas, así que si las tenés, conviene "
-            "poner el ancho real a mano.\n\n"
-            "Conteo de plantas (opcional, aproximado): cuenta componentes "
-            "conectados (manchas de vegetación) dentro de esa misma franja. "
-            "Solo es confiable en etapas donde las plantas están separadas "
-            "entre sí. Se agrega un campo de área promedio por planta como "
-            "diagnóstico: si sale mucho más grande de lo esperado, es señal "
-            "de que el dosel ya está cerrado y el conteo está subestimado "
-            "(varias plantas fusionadas en un solo blob)."
+            "Dibuja una línea por hilera de cultivo (viñedo, frutal, hortalizas en línea) "
+            "sobre una imagen RGB de dron o satelital. No hace falta entrenar nada.\n"
+            "<b>Uso básico</b>\n"
+            "1. <b>Imagen</b>: el ortomosaico, en un sistema de coordenadas en metros (UTM).\n"
+            "2. <b>Lotes</b> (recomendado): un polígono por lote o cuartel. Cada uno se "
+            "procesa por separado y las líneas no salen de él: dibujá la cabecera sobre la "
+            "calle.\n"
+            "3. <b>Distancia entre hileras</b>: dejala en -1. Indicala solo si el log muestra "
+            "una separación equivocada.\n"
+            "El log muestra, por lote, el rumbo, la separación y cuántas hileras encontró.\n"
+            "<b>Qué más se puede obtener</b> (casillas, todas desactivadas por defecto)\n"
+            "• <b>Cuarteles automáticos</b>: si no tenés los lotes dibujados, los busca en la "
+            "imagen (zonas con patrón de hileras) y procesa cada uno con su propio rumbo y "
+            "distancia.\n"
+            "• <b>Fallas por hilera</b>: tramos sin planta. Solo con imágenes de dron; con "
+            "imágenes satelitales se omite con un aviso.\n"
+            "<b>Si algo sale mal</b>\n"
+            "• Separación o rumbo equivocados en el log: indicá la distancia entre hileras.\n"
+            "• Las líneas caen al costado de las plantas (sobre la sombra o la entrehilera): "
+            "en Parámetros avanzados, 'Franja de la hilera'.\n"
+            "• Faltan tramos de hileras débiles: bajá la 'Sensibilidad'; aparecen tramos "
+            "sobre cosas que no son hileras: subila.\n"
+            "• Un lote junta cuadros con otra separación o rumbo: dibujá un polígono por "
+            "cuadro.\n"
+            "<b>Campo 'revisar'</b>: cuando una decisión automática queda con poco margen, "
+            "el log lo avisa en rojo y cada línea lleva el motivo: 'rumbo' (marco casi "
+            "cuadrado o periodicidad débil), 'franja' (dudosa qué franja es la hilera), "
+            "'cobertura' (menos del 70% de las hileras con línea) o 'cuadros' (parte del "
+            "lote con otra separación). Coloreá la capa por ese campo y mirá esos lotes.\n"
+            "<b>Parámetros avanzados</b>: pasá el mouse sobre cada uno para ver qué hace. En "
+            "general no hace falta tocarlos.\n"
+            "<b>Cómo funciona</b>: mide el rumbo y la separación de las hileras con la FFT "
+            "del verdor, ubica cada hilera con el perfil perpendicular y la sigue a lo largo "
+            "mientras sea más verde (o más oscura) que sus dos entrehileras. Las hileras "
+            "terminan donde termina lo plantado, sin entrar en la calle de cabecera. El "
+            "detalle está en el README del complemento."
         )
 
     def initAlgorithm(self, config=None):
-        # Parámetros que solo usa el método Canny + Hough: van a "Parámetros
-        # avanzados" para no recargar el diálogo con el método por defecto.
-        hough_only = {
-            self.MAX_LINE_GAP, self.HOUGH_THRESHOLD, self.CLOSING_PX,
-            self.FILTER_ANGLE, self.ANGLE_FILTER_TOL, self.MERGE_LINES,
-            self.MERGE_ANGLE_TOL, self.MERGE_DIST_TOL, self.MERGE_MAX_LENGTH,
-        }
-        advanced = hough_only | {self.SENSITIVITY, self.VEG_INDEX, self.STRIPE}
-
-        def add(param):
-            if param.name() in advanced:
+        # Diálogo: a la vista solo lo que cualquiera necesita (imagen, lotes,
+        # distancia y qué obtener); el resto en "Parámetros avanzados". Cada
+        # parámetro tiene un título corto y su explicación en la ayuda
+        # emergente (setHelp, se ve al pasar el mouse).
+        def add(param, help_text=None, advanced=False):
+            if advanced:
                 param.setFlags(param.flags() | QgsProcessingParameterDefinition.FlagAdvanced)
+            if help_text:
+                param.setHelp(self.tr(help_text))
             self.addParameter(param)
 
+        Number = QgsProcessingParameterNumber
+
+        # --- a la vista -----------------------------------------------------
         add(
-            QgsProcessingParameterRasterLayer(self.INPUT, self.tr("Raster de entrada (ortomosaico RGB)"))
-        )
-        add(
-            QgsProcessingParameterBand(
-                self.RED_BAND, self.tr("Banda Roja"), 1, self.INPUT
-            )
-        )
-        add(
-            QgsProcessingParameterBand(
-                self.GREEN_BAND, self.tr("Banda Verde"), 2, self.INPUT
-            )
-        )
-        add(
-            QgsProcessingParameterBand(
-                self.BLUE_BAND, self.tr("Banda Azul"), 3, self.INPUT
-            )
-        )
-        add(
-            QgsProcessingParameterEnum(
-                self.METHOD,
-                self.tr("Método de detección"),
-                options=[
-                    self.tr(
-                        "Perfil de proyección orientado por FFT (hileras "
-                        "rectas y paralelas: viñedo, frutal, cultivos en línea)"
-                    ),
-                    self.tr("Canny + Hough (método anterior)"),
-                ],
-                defaultValue=self.METHOD_PROFILE,
-            )
+            QgsProcessingParameterRasterLayer(self.INPUT, self.tr("Imagen (ortomosaico RGB)")),
+            "Imagen con bandas roja, verde y azul, de dron o satelital, en un sistema de "
+            "coordenadas en metros (UTM). Tiene que ser un archivo: una capa web (Google, XYZ) "
+            "hay que guardarla antes con 'Convertir mapa a ráster'. Los píxeles sin datos "
+            "(transparentes o nodata, como el área fuera de un recorte) se ignoran.",
         )
         add(
             QgsProcessingParameterFeatureSource(
-                self.CONTOUR,
-                self.tr(
-                    "Contorno de la parcela o lotes (polígonos, opcional). Las "
-                    "líneas se recortan estrictamente a este contorno. Cada "
-                    "polígono (uno o varios) se procesa como un lote "
-                    "independiente (método de perfil). Si no se da, se usa el "
-                    "área con datos del raster (alfa/nodata)."
-                ),
-                [QgsProcessing.TypeVectorPolygon],
-                optional=True,
-            )
+                self.CONTOUR, self.tr("Lotes o cuarteles (polígonos, opcional)"),
+                [QgsProcessing.TypeVectorPolygon], optional=True,
+            ),
+            "Un polígono por lote o cuartel (recomendado). Cada uno se procesa por separado, "
+            "con su propio rumbo, separación y numeración (campo 'lote'), y las líneas no salen "
+            "de él: dibujá la cabecera sobre la calle, no antes de la última planta. Una hilera "
+            "dibujada sobre el borde del polígono se conserva entera. Se reproyecta solo. Si no "
+            "das lotes, se usa toda el área con datos de la imagen (o los cuarteles automáticos, "
+            "si activás esa opción).",
+        )
+        add(
+            Number(self.ROW_SPACING, self.tr("Distancia entre hileras en m (-1 = automática)"),
+                   Number.Double, defaultValue=-1, minValue=-1),
+            "Dejala en -1: el complemento la mide sola. Indicala (con un valor aproximado "
+            "alcanza) solo si el log muestra un rumbo o una separación equivocados, por "
+            "ejemplo la mitad de la real cuando hay pasto verde entre hileras. La búsqueda se "
+            "acota a entre 0,7 y 1,4 veces este valor.",
         )
         add(
             QgsProcessingParameterBoolean(
-                self.AUTO_BLOCKS,
-                self.tr(
-                    "Detectar los cuarteles automáticamente (método de perfil, "
-                    "solo si no se da un contorno). Primero se buscan las zonas "
-                    "con patrón de hileras en la imagen (el verdor sin patrón, "
-                    "como monte o pasto, no cuenta como cuartel; las calles "
-                    "separan cuarteles) y cada cuartel estima después su propio "
-                    "rumbo y su propia distancia entre hileras. Si no se "
-                    "encuentra ninguno se usa toda el área con datos."
-                ),
-                defaultValue=True,
-            )
+                self.AUTO_BLOCKS, self.tr("Sin lotes: detectar los cuarteles automáticamente"),
+                defaultValue=False),
+            "Solo actúa si no das lotes. Busca en la imagen las zonas con patrón de hileras "
+            "(el monte o el pasto no cuentan, las calles separan cuarteles) y procesa cada "
+            "cuartel por separado, con su propio rumbo y su propia distancia entre hileras. "
+            "Busca hileras de 1 a 8 m. Los polígonos salen en la capa 'Cuarteles detectados'.",
         )
         add(
-            QgsProcessingParameterNumber(
-                self.EXTEND_MAX,
-                self.tr(
-                    "[Perfil] Extender cada hilera hasta el borde del contorno "
-                    "si le faltan como máximo estos metros (default 0 = no "
-                    "extender: la hilera termina donde termina lo plantado, "
-                    "sin entrar en la calle de cabecera). Usalo solo si el "
-                    "contorno es el del área plantada, no el del lote con "
-                    "calles."
-                ),
-                QgsProcessingParameterNumber.Double,
-                defaultValue=0.0,
-                minValue=0.0,
-            )
+            QgsProcessingParameterBoolean(
+                self.DETECT_FAILURES, self.tr("Detectar fallas por hilera (solo imágenes de dron)"),
+                defaultValue=False),
+            "Marca los tramos de cada hilera sin planta, en la capa 'Fallas por hilera'. Hace "
+            "falta un píxel de menos de 0,2 m y un detalle real igual de fino: con imágenes "
+            "satelitales (aunque digan 0,125 m por píxel, su detalle real es de 0,3-0,4 m) se "
+            "omite con un aviso. Las hileras no cambian con esta opción.",
         )
-        add(
-            QgsProcessingParameterNumber(
-                self.ROW_SPACING,
-                self.tr(
-                    "[Perfil] Distancia aproximada entre hileras, en metros "
-                    "(-1 = automático por FFT). Solo si el automático se "
-                    "equivoca: la búsqueda se acota a entre 0,7 y 1,4 veces este "
-                    "valor, y se prefiere el patrón más fuerte a ±10%."
-                ),
-                QgsProcessingParameterNumber.Double,
-                defaultValue=-1,
-                minValue=-1,
-            )
-        )
+        # --- parámetros avanzados (plegados) ----------------------------------
+        add(QgsProcessingParameterBand(self.RED_BAND, self.tr("Banda roja"), 1, self.INPUT), advanced=True)
+        add(QgsProcessingParameterBand(self.GREEN_BAND, self.tr("Banda verde"), 2, self.INPUT), advanced=True)
+        add(QgsProcessingParameterBand(self.BLUE_BAND, self.tr("Banda azul"), 3, self.INPUT), advanced=True)
         add(
             QgsProcessingParameterField(
-                self.SPACING_FIELD,
-                self.tr(
-                    "[Perfil] Campo de la capa de contorno con la distancia entre "
-                    "hileras de cada lote, en metros (opcional). En los lotes "
-                    "donde el campo tiene un valor > 0, reemplaza a la distancia "
-                    "de arriba; vacío o <= 0 = automático. Sirve para correr "
-                    "juntos cultivos de separación muy distinta (frutal y "
-                    "hortaliza)."
-                ),
+                self.SPACING_FIELD, self.tr("Campo de los lotes con su distancia entre hileras"),
                 parentLayerParameterName=self.CONTOUR,
-                type=QgsProcessingParameterField.Numeric,
-                optional=True,
-            )
+                type=QgsProcessingParameterField.Numeric, optional=True,
+            ),
+            "Campo numérico de la capa de lotes con la distancia entre hileras de cada lote, "
+            "en metros. Donde es mayor que 0 reemplaza a la distancia general; vacío o 0, "
+            "automática. Sirve para correr juntos cultivos de separación muy distinta "
+            "(un frutal y una hortaliza).",
+            advanced=True,
         )
         add(
-            QgsProcessingParameterNumber(
-                self.SENSITIVITY,
-                self.tr(
-                    "[Perfil] Umbral de contraste hilera/entrehilera, en "
-                    "múltiplos del ruido (default 3). Más bajo = detecta "
-                    "hileras más débiles, pero con más falsos positivos."
-                ),
-                QgsProcessingParameterNumber.Double,
-                defaultValue=3.0,
-                minValue=0.5,
-                maxValue=20.0,
-            )
+            Number(self.EXTEND_MAX, self.tr("Extender hileras hasta el borde del lote (m)"),
+                   Number.Double, defaultValue=0.0, minValue=0.0),
+            "Prolonga cada hilera hasta el borde del polígono si le faltan como máximo estos "
+            "metros. 0 = no extender: la hilera termina donde termina lo plantado. Usalo solo si "
+            "el polígono es el del área plantada; con el del lote, las líneas atravesarían las "
+            "calles de cabecera.",
+            advanced=True,
+        )
+        add(
+            Number(self.SENSITIVITY, self.tr("Sensibilidad (contraste mínimo, en ruidos)"),
+                   Number.Double, defaultValue=3.0, minValue=0.5, maxValue=20.0),
+            "Cuánto más verde (u oscura) que sus entrehileras tiene que ser la hilera, en "
+            "múltiplos del ruido de la imagen. Bajala si faltan tramos de hileras débiles; "
+            "subila si aparecen tramos sobre cosas que no son hileras.",
+            advanced=True,
         )
         add(
             QgsProcessingParameterEnum(
-                self.STRIPE,
-                self.tr("[Perfil] Franja de la hilera"),
+                self.STRIPE, self.tr("Franja de la hilera"),
                 options=[
-                    self.tr(
-                        "Automático: la franja más verde; la oscura si la canopia no "
-                        "es verde; las copas iluminadas en frutales de copa cerrada"
-                    ),
-                    self.tr(
-                        "Franja más verde (verdor cromático): canopia oscura o con "
-                        "su sombra; viñedos, frutales con suelo entre hileras"
-                    ),
-                    self.tr(
-                        "Copas iluminadas (verde absoluto 2G-R-B): frutal de copa "
-                        "cerrada, sin suelo visible entre hileras"
-                    ),
-                    self.tr(
-                        "Franja oscura (brillo): canopia poco verde o rojiza (sin "
-                        "hojas, otoño), sobre suelo claro"
-                    ),
+                    self.tr("Automática (recomendada)"),
+                    self.tr("La más verde (viñedo, frutal con suelo entre hileras)"),
+                    self.tr("Copas iluminadas (frutal de copa cerrada)"),
+                    self.tr("La más oscura (canopia sin hojas o rojiza)"),
                 ],
                 defaultValue=self.STRIPE_AUTO,
-            )
+            ),
+            "Qué franja de la imagen es la hilera. En automático: la más verde; la oscura si la "
+            "canopia no es verde (sin hojas, otoño, rojiza); las copas iluminadas en un frutal "
+            "de copa cerrada; y si la oscura es la sombra al costado de una canopia verde, la "
+            "verde. Cambiala solo si las líneas caen al costado de las plantas (el log dice qué "
+            "franja eligió y por qué).",
+            advanced=True,
         )
         add(
-            QgsProcessingParameterEnum(
-                self.VEG_INDEX,
-                self.tr("Índice de vegetación"),
-                options=[
-                    self.tr(
-                        "ExG cromático: (2G-R-B)/(R+G+B) (Woebbecke et al. "
-                        "1995; independiente del brillo)"
-                    ),
-                    self.tr("ExG sin normalizar: 2G-R-B (versiones <= 0.6)"),
-                ],
-                defaultValue=self.INDEX_EXG_CHROMATIC,
-            )
+            Number(self.MIN_LENGTH_M, self.tr("Largo mínimo de un tramo de hilera (m)"),
+                   Number.Double, defaultValue=self.MIN_LENGTH_M_DEF, minValue=0.1),
+            "Tramos de hilera más cortos que esto se descartan.",
+            advanced=True,
         )
         add(
-            QgsProcessingParameterNumber(
-                self.THRESHOLD,
-                self.tr("Umbral de binarización (-1 = automático, Otsu)"),
-                QgsProcessingParameterNumber.Double,
-                defaultValue=-1,
-            )
+            Number(self.MAX_GAP_M, self.tr("Hueco máximo dentro de una hilera (m)"),
+                   Number.Double, defaultValue=self.MAX_GAP_M_DEF, minValue=0.0),
+            "Huecos (plantas faltantes) de hasta este largo se unen dentro de la misma "
+            "hilera; los más largos la cortan en dos tramos. Nunca menos de 2,4 separaciones "
+            "entre hileras: en un frutal a 5 m, faltan 3-4 árboles y la hilera sigue entera.",
+            advanced=True,
         )
         add(
-            QgsProcessingParameterNumber(
-                self.MIN_LINE_LENGTH,
-                self.tr("Longitud mínima de línea / tramo de hilera (píxeles)"),
-                QgsProcessingParameterNumber.Integer,
-                defaultValue=50,
-                minValue=1,
-            )
+            Number(self.FAIL_THRESHOLD, self.tr("Fallas: umbral de vigor (0 = entrehilera, 1 = planta)"),
+                   Number.Double, defaultValue=0.5, minValue=0.05, maxValue=0.95),
+            "El verdor de la hilera se mide entre la entrehilera (0) y una planta típica del "
+            "cuartel (1). Falla es un tramo continuo por debajo de este valor. Más alto marca "
+            "más fallas.",
+            advanced=True,
         )
         add(
-            QgsProcessingParameterNumber(
-                self.MAX_LINE_GAP,
-                self.tr("[Hough] Distancia máxima entre segmentos para unirlos (píxeles)"),
-                QgsProcessingParameterNumber.Integer,
-                defaultValue=20,
-                minValue=0,
-            )
+            Number(self.FAIL_MIN_LEN, self.tr("Fallas: largo mínimo (m)"),
+                   Number.Double, defaultValue=2.0, minValue=0.1),
+            "Tramos bajos más cortos que esto no se marcan como falla.",
+            advanced=True,
         )
+        # --- salidas -----------------------------------------------------------
+        add(QgsProcessingParameterVectorDestination(self.OUTPUT, self.tr("Hileras detectadas")))
         add(
-            QgsProcessingParameterNumber(
-                self.HOUGH_THRESHOLD,
-                self.tr("[Hough] Umbral de Hough (votos mínimos para aceptar una línea)"),
-                QgsProcessingParameterNumber.Integer,
-                defaultValue=80,
-                minValue=1,
-            )
-        )
-        add(
-            QgsProcessingParameterNumber(
-                self.CLOSING_PX,
-                self.tr(
-                    "[Hough] Cierre morfológico antes de Canny, en píxeles (0 = "
-                    "desactivado). Útil en viñedo/frutal: une plantas "
-                    "individuales muy próximas en un blob más continuo, "
-                    "antes de que Canny fragmente cada una por separado."
-                ),
-                QgsProcessingParameterNumber.Integer,
-                defaultValue=0,
-                minValue=0,
-            )
-        )
-        add(
-            QgsProcessingParameterBoolean(
-                self.FILTER_ANGLE,
-                self.tr(
-                    "[Hough] Filtrar segmentos por dirección dominante antes de fusionar"
-                ),
-                defaultValue=True,
-            )
-        )
-        add(
-            QgsProcessingParameterNumber(
-                self.ANGLE_FILTER_TOL,
-                self.tr(
-                    "[Hough] Tolerancia del filtro de dirección dominante (grados)"
-                ),
-                QgsProcessingParameterNumber.Double,
-                defaultValue=15.0,
-                minValue=0.5,
-                maxValue=90.0,
-            )
-        )
-        add(
-            QgsProcessingParameterBoolean(
-                self.MERGE_LINES,
-                self.tr("[Hough] Fusionar segmentos en una sola línea por hilera"),
-                defaultValue=True,
-            )
-        )
-        add(
-            QgsProcessingParameterNumber(
-                self.MERGE_ANGLE_TOL,
-                self.tr("[Hough] Tolerancia de ángulo para fusionar (grados)"),
-                QgsProcessingParameterNumber.Double,
-                defaultValue=5.0,
-                minValue=0.1,
-                maxValue=90.0,
-            )
-        )
-        add(
-            QgsProcessingParameterNumber(
-                self.MERGE_DIST_TOL,
-                self.tr(
-                    "[Hough] Distancia perpendicular máxima para fusionar, en "
-                    "píxeles (-1 = automático). El automático mide la "
-                    "separación real entre hileras a partir de los "
-                    "segmentos detectados y usa un 40% de esa distancia — "
-                    "pensado para hileras muy juntas (viñedo/frutal de alta "
-                    "densidad), donde un valor fijo grande termina "
-                    "fusionando varias hileras vecinas en una sola. Si tus "
-                    "hileras son muy onduladas (no rectas), el automático "
-                    "puede ser demasiado estricto y fragmentarlas: en ese "
-                    "caso poné un valor manual más alto."
-                ),
-                QgsProcessingParameterNumber.Double,
-                defaultValue=-1,
-                minValue=-1,
-            )
-        )
-        add(
-            QgsProcessingParameterNumber(
-                self.MERGE_MAX_GAP,
-                self.tr(
-                    "Espacio longitudinal máximo, en píxeles a lo largo de "
-                    "la hilera (default 60). Método de perfil: hueco máximo "
-                    "(plantas faltantes) que se une dentro de una misma "
-                    "hilera; huecos más largos cortan la hilera en dos "
-                    "tramos. Método Hough: espacio máximo entre segmentos "
-                    "para fusionarlos — la salvaguarda más importante: sin "
-                    "ella, dos segmentos con ángulo y distancia perpendicular "
-                    "parecidos se fusionan aunque estén a cientos de "
-                    "píxeles de distancia entre sí a lo largo de la hilera "
-                    "— con un camino, un límite de parcela o cualquier zona "
-                    "sin relación en el medio — que es la causa más común "
-                    "de líneas absurdamente largas cruzando toda la "
-                    "imagen. Subí este valor solo si tus hileras tienen "
-                    "huecos reales (plantas faltantes) más largos que el "
-                    "default."
-                ),
-                QgsProcessingParameterNumber.Double,
-                defaultValue=60,
-                minValue=0,
-            )
-        )
-        add(
-            QgsProcessingParameterNumber(
-                self.MERGE_MAX_LENGTH,
-                self.tr(
-                    "[Hough] Longitud máxima de una hilera fusionada, en metros "
-                    "(-1 = sin límite). Salvaguarda adicional, en general "
-                    "ya no hace falta si el 'espacio longitudinal máximo' "
-                    "de arriba está funcionando bien — pero puede servir "
-                    "como límite absoluto extra si conocés la longitud "
-                    "real máxima de tus hileras."
-                ),
-                QgsProcessingParameterNumber.Double,
-                defaultValue=-1,
-            )
-        )
-        add(
-            QgsProcessingParameterBoolean(
-                self.CALC_COVERAGE,
-                self.tr("Calcular % de cobertura de suelo (fracción cultivable)"),
-                defaultValue=False,
-            )
-        )
-        add(
-            QgsProcessingParameterNumber(
-                self.COVERAGE_WIDTH,
-                self.tr(
-                    "Ancho de franja cultivable por hilera, en metros "
-                    "(-1 = automático, según distancia entre hileras vecinas)"
-                ),
-                QgsProcessingParameterNumber.Double,
-                defaultValue=-1,
-            )
-        )
-        add(
-            QgsProcessingParameterBoolean(
-                self.CALC_PLANT_COUNT,
-                self.tr(
-                    "Estimar número de plantas por hilera (aproximado: solo "
-                    "confiable con plantas separadas, no con dosel cerrado)"
-                ),
-                defaultValue=False,
-            )
-        )
-        add(
-            QgsProcessingParameterNumber(
-                self.MIN_PLANT_AREA,
-                self.tr("Área mínima para contar como planta (m²), filtra ruido"),
-                QgsProcessingParameterNumber.Double,
-                defaultValue=0.01,
-                minValue=0.0001,
+            QgsProcessingParameterVectorDestination(
+                self.OUT_BLOCKS, self.tr("Cuarteles detectados (si se activó la opción)"),
+                QgsProcessing.TypeVectorPolygon, optional=True, createByDefault=True,
             )
         )
         add(
             QgsProcessingParameterVectorDestination(
-                self.OUTPUT, self.tr("Hileras detectadas (líneas)")
-            )
-        )
-        add(
-            QgsProcessingParameterVectorDestination(
-                self.OUT_BLOCKS, self.tr("Cuarteles detectados (polígonos)"),
-                QgsProcessing.TypeVectorPolygon, optional=True, createByDefault=False,
+                self.OUT_FAILURES, self.tr("Fallas por hilera (si se activó la opción)"),
+                QgsProcessing.TypeVectorLine, optional=True, createByDefault=True,
             )
         )
 
+    @staticmethod
+    def _out_of_memory(err):
+        """¿err es una falta de memoria (de numpy, de GDAL o de OpenCV)?"""
+        return (isinstance(err, MemoryError) or "Insufficient memory" in str(err)
+                or "Failed to allocate" in str(err))
+
     def processAlgorithm(self, parameters, context, feedback):
+        try:
+            return self._process(parameters, context, feedback)
+        except Exception as err:
+            if not self._out_of_memory(err):
+                raise
+            # la imagen entera se lee en memoria: con un ortomosaico muy grande
+            # salía un error técnico en inglés
+            raise QgsProcessingException(
+                self.tr(
+                    "No alcanzó la memoria para procesar la imagen (se lee completa). Recortala a la "
+                    "zona de interés (Ráster > Extracción > Cortar ráster por extensión) o exportala "
+                    "con un píxel más grande, y volvé a ejecutar."
+                )
+            ) from None
+
+    def _process(self, parameters, context, feedback):
         try:
             import cv2
         except ImportError:
@@ -3081,29 +3024,16 @@ class DetectCropRowsAlgorithm(QgsProcessingAlgorithm):
         red_idx = self.parameterAsInt(parameters, self.RED_BAND, context)
         green_idx = self.parameterAsInt(parameters, self.GREEN_BAND, context)
         blue_idx = self.parameterAsInt(parameters, self.BLUE_BAND, context)
-        method = self.parameterAsEnum(parameters, self.METHOD, context)
-        veg_index = self.parameterAsEnum(parameters, self.VEG_INDEX, context)
         contour_source = self.parameterAsSource(parameters, self.CONTOUR, context)
         auto_blocks = self.parameterAsBool(parameters, self.AUTO_BLOCKS, context)
         extend_max_m = self.parameterAsDouble(parameters, self.EXTEND_MAX, context)
         row_spacing_m = self.parameterAsDouble(parameters, self.ROW_SPACING, context)
         sensitivity = self.parameterAsDouble(parameters, self.SENSITIVITY, context)
-        threshold_val = self.parameterAsDouble(parameters, self.THRESHOLD, context)
-        min_line_length = self.parameterAsInt(parameters, self.MIN_LINE_LENGTH, context)
-        max_line_gap = self.parameterAsInt(parameters, self.MAX_LINE_GAP, context)
-        hough_threshold = self.parameterAsInt(parameters, self.HOUGH_THRESHOLD, context)
-        closing_px = self.parameterAsInt(parameters, self.CLOSING_PX, context)
-        filter_angle = self.parameterAsBool(parameters, self.FILTER_ANGLE, context)
-        angle_filter_tol = self.parameterAsDouble(parameters, self.ANGLE_FILTER_TOL, context)
-        merge_lines = self.parameterAsBool(parameters, self.MERGE_LINES, context)
-        merge_angle_tol = self.parameterAsDouble(parameters, self.MERGE_ANGLE_TOL, context)
-        merge_dist_tol_param = self.parameterAsDouble(parameters, self.MERGE_DIST_TOL, context)
-        merge_max_gap_param = self.parameterAsDouble(parameters, self.MERGE_MAX_GAP, context)
-        merge_max_length_m = self.parameterAsDouble(parameters, self.MERGE_MAX_LENGTH, context)
-        calc_coverage = self.parameterAsBool(parameters, self.CALC_COVERAGE, context)
-        coverage_width_m = self.parameterAsDouble(parameters, self.COVERAGE_WIDTH, context)
-        calc_plant_count = self.parameterAsBool(parameters, self.CALC_PLANT_COUNT, context)
-        min_plant_area_m2 = self.parameterAsDouble(parameters, self.MIN_PLANT_AREA, context)
+        min_length_m = self.parameterAsDouble(parameters, self.MIN_LENGTH_M, context)
+        max_gap_m = self.parameterAsDouble(parameters, self.MAX_GAP_M, context)
+        detect_failures = self.parameterAsBool(parameters, self.DETECT_FAILURES, context)
+        fail_threshold = self.parameterAsDouble(parameters, self.FAIL_THRESHOLD, context)
+        fail_min_len = self.parameterAsDouble(parameters, self.FAIL_MIN_LEN, context)
         spacing_fields = self.parameterAsFields(parameters, self.SPACING_FIELD, context) or []
         spacing_field = spacing_fields[0] if spacing_fields else None
         stripe_mode = self.parameterAsEnum(parameters, self.STRIPE, context)
@@ -3111,9 +3041,62 @@ class DetectCropRowsAlgorithm(QgsProcessingAlgorithm):
         source_path = raster_layer.source()
         feedback.pushInfo(self.tr(f"Abriendo raster: {source_path}"))
 
-        ds = gdal.Open(source_path)
+        try:
+            ds = gdal.Open(source_path)
+        except RuntimeError:   # GDAL con excepciones activadas (otro complemento)
+            ds = None
         if ds is None:
+            if raster_layer.providerType() != "gdal":
+                # una capa web (Google, XYZ, WMS...) no es un archivo que se pueda leer
+                raise QgsProcessingException(
+                    self.tr(
+                        "La imagen elegida no es un archivo: es una capa web o de otro origen (Google, "
+                        f"XYZ, WMS...; proveedor '{raster_layer.providerType()}'). El complemento necesita un "
+                        "archivo ráster: guardá primero la zona con 'Convertir mapa a ráster' (caja de "
+                        "herramientas de Procesos), con el proyecto en un sistema de coordenadas en "
+                        "metros, y elegí ese archivo."
+                    )
+                )
             raise QgsProcessingException(self.tr("GDAL no pudo abrir el raster."))
+        if raster_layer.crs().isGeographic():
+            # En grados el tamaño de píxel no está en metros: el largo mínimo de
+            # 6,25 m pasaba a ser de millones de píxeles y la corrida terminaba
+            # sin ninguna línea y sin decir por qué. Además el píxel en grados no
+            # es cuadrado en el terreno (a 33° de latitud, 16% más angosto).
+            raise QgsProcessingException(
+                self.tr(
+                    "La imagen está en grados (sistema de coordenadas geográfico "
+                    f"{raster_layer.crs().authid()}) y el complemento mide en metros. Reproyectala a "
+                    "un sistema en metros (UTM o POSGAR; por ejemplo EPSG:32719 en Mendoza) con "
+                    "Ráster > Proyecciones > Combar (reproyectar) y volvé a ejecutar con la imagen "
+                    "reproyectada."
+                )
+            )
+        if raster_layer.crs().projectionAcronym() == "merc":
+            # Mercator (EPSG:3857 es el CRS de los mapas web y el que toma un
+            # proyecto de QGIS que empieza con Google o XYZ): sus unidades se
+            # llaman metros pero se estiran con la latitud, 19% en Mendoza. Las
+            # líneas salen bien; las distancias, no.
+            k_merc = None
+            try:
+                to_geo = QgsCoordinateTransform(
+                    raster_layer.crs(), QgsCoordinateReferenceSystem("EPSG:4326"), context.transformContext())
+                lat = to_geo.transform(raster_layer.extent().center()).y()
+                if abs(lat) < 85.0:
+                    k_merc = 1.0 / math.cos(math.radians(lat))
+            except Exception:
+                pass
+            feedback.reportError(
+                self.tr(
+                    f"AVISO: la imagen está en proyección Mercator ({raster_layer.crs().authid()}, la de los "
+                    "mapas web). Sus unidades no son metros reales"
+                    + (f": acá 1 m del terreno mide {k_merc:.2f}" if k_merc else "")
+                    + ". Las hileras salen igual, pero las distancias del log, las longitudes y los "
+                    "parámetros en metros quedan en esa escala. Para medidas reales, reproyectá la "
+                    "imagen a UTM o POSGAR (Ráster > Proyecciones > Combar (reproyectar))."
+                ),
+                fatalError=False,
+            )
 
         band_count = ds.RasterCount
         if band_count < 3:
@@ -3143,8 +3126,27 @@ class DetectCropRowsAlgorithm(QgsProcessingAlgorithm):
         px_w = abs(geotransform[1])
         px_h = abs(geotransform[5])
         pixel_size_avg = (px_w + px_h) / 2.0
-        pixel_area_m2 = px_w * px_h
-        raster_is_geographic = raster_layer.crs().isGeographic()
+        # largo mínimo y hueco máximo en metros -> píxeles del raster (hasta la
+        # 0.24 se daban en píxeles: 50 y 60 px eran 6,25 y 7,5 m en las imágenes
+        # de Google a 0,125 m, 10 y 12 m a 0,2 m y 2,7 y 3,2 m en un dron a 0,054)
+        min_line_length = min_length_m / pixel_size_avg
+        merge_max_gap_param = max_gap_m / pixel_size_avg
+
+        # Los lotes, antes de leer la imagen: una capa de lotes sin polígonos
+        # válidos (vacía, o con "solo objetos seleccionados" y nada
+        # seleccionado) se avisa ya, no después de procesar la imagen entera.
+        lots = (
+            self._lot_geometries(contour_source, raster_layer.crs(), context, spacing_field)
+            if contour_source is not None else []
+        )
+        if contour_source is not None and not lots and not auto_blocks:
+            raise QgsProcessingException(
+                self.tr(
+                    "La capa de lotes no tiene ningún polígono válido (¿está vacía, o se marcó "
+                    "'Solo objetos seleccionados' sin nada seleccionado?). Elegí otra capa, o dejá "
+                    "el campo vacío para usar toda el área con datos de la imagen."
+                )
+            )
 
         def read_band(idx):
             band = ds.GetRasterBand(idx)
@@ -3152,8 +3154,10 @@ class DetectCropRowsAlgorithm(QgsProcessingAlgorithm):
                 raise QgsProcessingException(
                     self.tr(f"No se pudo leer la banda {idx} del raster (el raster tiene {band_count} banda(s)).")
                 )
-            arr = band.ReadAsArray().astype(np.float32)
-            return arr
+            arr = band.ReadAsArray()
+            if arr is None:   # GDAL no pudo reservar la memoria de la banda
+                raise MemoryError()
+            return arr.astype(np.float32)
 
         feedback.pushInfo(self.tr("Leyendo bandas R, G, B..."))
         r = read_band(red_idx)
@@ -3162,12 +3166,21 @@ class DetectCropRowsAlgorithm(QgsProcessingAlgorithm):
 
         # Píxeles válidos según GDAL (banda alfa, nodata, o todo válido si no
         # hay ninguno de los dos). Sin esto, el área transparente de un raster
-        # recortado (RGB = 0) entra en el Otsu como si fuera suelo y corre el
-        # umbral, y el borde del recorte aparece como un borde más.
+        # recortado (RGB = 0) entra en los cálculos como si fuera suelo, y el
+        # borde del recorte aparece como un borde más.
         valid = np.ones(r.shape, dtype=bool)
         for idx in (red_idx, green_idx, blue_idx):
             valid &= ds.GetRasterBand(idx).GetMaskBand().ReadAsArray() > 0
-        valid &= np.isfinite(r) & np.isfinite(g) & np.isfinite(b)
+        # NaN o infinito (el "sin datos" de algunos rasters de coma flotante):
+        # sin datos, y a 0 para que el suavizado de las bandas no los propague
+        # a los píxeles válidos de al lado (el verdor quedaba en NaN y no se
+        # podía estimar nada).
+        for band_arr in (r, g, b):
+            bad = ~np.isfinite(band_arr)
+            if bad.any():
+                valid &= ~bad
+                band_arr[bad] = 0.0
+        del bad
         if not valid.any():
             raise QgsProcessingException(
                 self.tr("El raster no tiene píxeles válidos (todo es nodata/transparente).")
@@ -3193,45 +3206,21 @@ class DetectCropRowsAlgorithm(QgsProcessingAlgorithm):
         # densa): sin normalizar, 2G-R-B escala con el brillo, y un suelo
         # claro apenas verdoso da más que una canopia verde oscura, con lo
         # que las "hileras" detectadas caen sobre la entrehilera.
-        if veg_index == self.INDEX_EXG_RAW:
-            exg = 2.0 * g - r - b
-        else:
-            # Las bandas se suavizan levemente (sigma 1 px) antes de dividir:
-            # en píxeles casi negros (canopia en sombra, 0-3 DN) la
-            # cromaticidad está cuantizada y es puro ruido (p. ej. RGB 0,1,0
-            # da ExG = 2), lo que moteaba la máscara de vegetación y
-            # arrastraba el umbral de Otsu. Promediar con los vecinos antes
-            # del cociente estabiliza el índice sin mover las hileras.
-            rs, gs, bs = (cv2.GaussianBlur(x, (0, 0), 1.0) for x in (r, g, b))
-            total = rs + gs + bs
-            exg = (2.0 * gs - rs - bs) / np.maximum(total, 1e-6)
-            exg[total <= 0] = 0.0
-            del rs, gs, bs, total
-        exg[~valid] = 0.0
+        # Las bandas se suavizan levemente (sigma 1 px) antes de dividir: en
+        # píxeles casi negros (canopia en sombra, 0-3 DN) la cromaticidad está
+        # cuantizada y es puro ruido (p. ej. RGB 0,1,0 da ExG = 2). Promediar
+        # con los vecinos antes del cociente estabiliza el índice sin mover
+        # las hileras.
+        exg = chroma_exg(cv2, r, g, b, valid, 1.0)
 
-        # Normalizar a 0-255 (uint8) para trabajar con OpenCV. Percentiles
-        # en vez de mín/máx: en el índice cromático unos pocos píxeles casi
-        # negros pueden dar valores extremos y comprimirían todo el rango.
+        # Sin variación de verdor (bandas mal elegidas, raster uniforme) no hay
+        # hileras que buscar. Percentiles en vez de mín/máx: unos pocos píxeles
+        # casi negros pueden dar valores extremos.
         exg_min, exg_max = (float(v) for v in np.percentile(exg[valid], [0.5, 99.5]))
         if exg_max - exg_min < 1e-6:
             raise QgsProcessingException(
                 self.tr("El índice ExG no tiene variación (imagen uniforme). Revisá las bandas elegidas.")
             )
-        # La máscara binaria solo la usan el método Hough y los cálculos
-        # opcionales de cobertura y conteo de plantas.
-        binary = None
-        if method == self.METHOD_HOUGH or calc_coverage or calc_plant_count:
-            exg_norm = np.zeros(exg.shape, dtype=np.uint8)
-            exg_norm[valid] = (np.clip((exg[valid] - exg_min) / (exg_max - exg_min), 0.0, 1.0) * 255.0).astype(np.uint8)
-            feedback.pushInfo(self.tr("Binarizando (Otsu si corresponde)..."))
-            if threshold_val is None or threshold_val < 0:
-                # Otsu calculado solo sobre los píxeles válidos
-                threshold_val, _ = cv2.threshold(
-                    exg_norm[valid].reshape(-1, 1), 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
-                )
-            binary = np.where(valid & (exg_norm > threshold_val), 255, 0).astype(np.uint8)
-            del exg_norm
-
         feedback.setProgress(45)
         if feedback.isCanceled():
             return {}
@@ -3243,200 +3232,64 @@ class DetectCropRowsAlgorithm(QgsProcessingAlgorithm):
         line_flags = None     # motivos de revisión de cada línea (método de perfil)
         auto_info = []        # cuarteles detectados de la imagen (ver _auto_lots)
         clipped_by_lot = False
-        if method == self.METHOD_PROFILE:
-            # Brillo como evidencia auxiliar de continuidad de la hilera
-            brightness = (r + g + b) / 3.0
-            brightness[~valid] = 0.0
-            # verde absoluto (2G-R-B), para la franja de la hilera en frutales
-            # de copa cerrada; con el índice sin normalizar ya es el índice
-            rgb = (r, g, b) if veg_index != self.INDEX_EXG_RAW else None
-            lots = (
-                self._lot_geometries(contour_source, raster_layer.crs(), context, spacing_field)
-                if contour_source is not None else []
-            )
-            if not lots and auto_blocks:
-                lots, auto_info = self._auto_lots(
-                    exg, brightness, valid, pixel_size_avg, geotransform, feedback)
-            if lots:
-                # Cada polígono es un lote: su propia orientación, separación
-                # y alineación de hileras (dos lotes uno detrás del otro no
-                # tienen por qué tener las hileras alineadas), estimadas solo
-                # con sus píxeles, y recortado a su polígono, así que las
-                # calles entre lotes quedan afuera. También con un solo
-                # polígono: si el raster tiene otros cultivos alrededor, no
-                # entran en la estimación (antes sí: un frutal vecino fijaba el
-                # rumbo de una hortaliza).
-                if auto_info:
-                    msg = (f"{len(lots)} cuartel(es) detectado(s) de la imagen: cada uno "
-                           "estima su propio rumbo y su propia separación entre hileras.")
-                elif len(lots) >= 2:
-                    msg = f"Capa de contorno con {len(lots)} polígonos: se procesa cada uno como un lote independiente."
-                else:
-                    msg = ("Contorno de 1 polígono: orientación y separación se estiman "
-                           "solo con los píxeles de adentro.")
-                feedback.pushInfo(self.tr(msg))
-                if spacing_field:
-                    n_sp = sum(1 for lot in lots if lot[2])
-                    feedback.pushInfo(
-                        self.tr(f"Distancia entre hileras por lote (campo '{spacing_field}'): {n_sp} de {len(lots)} lotes la indican.")
-                    )
-                result = self._detect_rows_by_lot(
-                    cv2, gdal, lots, exg, valid, brightness, pixel_size_avg, geotransform,
-                    row_spacing_m, sensitivity, min_line_length, merge_max_gap_param,
-                    extend_max_m, feedback, rgb=rgb, stripe_mode=stripe_mode,
-                )
-                if result is None:
-                    return {}
-                lines, row_ids, line_lots, line_periods, line_flags = result
-                clipped_by_lot = True
-                feedback.pushInfo(
-                    self.tr(f"Total: {len(lines)} líneas en {len(set(line_lots))} lote(s) con hileras.")
-                )
+        # Brillo como evidencia auxiliar de continuidad de la hilera
+        brightness = (r + g + b) / 3.0
+        brightness[~valid] = 0.0
+        # verde absoluto (2G-R-B), para la franja de la hilera en frutales
+        # de copa cerrada
+        rgb = (r, g, b)
+        if not lots and auto_blocks:
+            lots, auto_info = self._auto_lots(
+                exg, brightness, valid, pixel_size_avg, geotransform, feedback)
+        if lots:
+            # Cada polígono es un lote: su propia orientación, separación
+            # y alineación de hileras (dos lotes uno detrás del otro no
+            # tienen por qué tener las hileras alineadas), estimadas solo
+            # con sus píxeles, y recortado a su polígono, así que las
+            # calles entre lotes quedan afuera. También con un solo
+            # polígono: si el raster tiene otros cultivos alrededor, no
+            # entran en la estimación (antes sí: un frutal vecino fijaba el
+            # rumbo de una hortaliza).
+            if auto_info:
+                msg = (f"{len(lots)} cuartel(es) detectado(s) de la imagen: cada uno "
+                       "estima su propio rumbo y su propia separación entre hileras.")
+            elif len(lots) >= 2:
+                msg = f"Capa de contorno con {len(lots)} polígonos: se procesa cada uno como un lote independiente."
             else:
-                result = self._detect_rows_profile(
-                    cv2, exg, valid, pixel_size_avg, geotransform, row_spacing_m,
-                    sensitivity, min_line_length, merge_max_gap_param, feedback,
-                    aux=brightness,
-                    green_fn=(None if rgb is None else (lambda: 2.0 * rgb[1] - rgb[0] - rgb[2])),
-                    stripe_mode=stripe_mode,
-                    chroma_fn=(None if rgb is None else (lambda s: chroma_exg(cv2, rgb[0], rgb[1], rgb[2], valid, s))),
-                )
-                if result is None:
-                    return {}
-                lines, row_ids, row_period_px = result
-                line_flags = [", ".join(self._doubts)] * len(lines)
-            del brightness
-        else:
-            if closing_px and closing_px > 0:
+                msg = ("Contorno de 1 polígono: orientación y separación se estiman "
+                       "solo con los píxeles de adentro.")
+            feedback.pushInfo(self.tr(msg))
+            if spacing_field:
+                n_sp = sum(1 for lot in lots if lot[2])
                 feedback.pushInfo(
-                    self.tr(f"Aplicando cierre morfológico ({closing_px}px) antes de Canny...")
+                    self.tr(f"Distancia entre hileras por lote (campo '{spacing_field}'): {n_sp} de {len(lots)} lotes la indican.")
                 )
-                kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (closing_px, closing_px))
-                binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
-
-            feedback.pushInfo(self.tr("Detectando bordes (Canny) y líneas (Hough)..."))
-            edges = cv2.Canny(binary, 50, 150)
-
-            lines = cv2.HoughLinesP(
-                edges,
-                rho=1,
-                theta=np.pi / 180,
-                threshold=hough_threshold,
-                minLineLength=min_line_length,
-                maxLineGap=max_line_gap,
+            result = self._detect_rows_by_lot(
+                cv2, gdal, lots, exg, valid, brightness, pixel_size_avg, geotransform,
+                row_spacing_m, sensitivity, min_line_length, merge_max_gap_param,
+                extend_max_m, feedback, rgb=rgb, stripe_mode=stripe_mode,
             )
-
-            feedback.setProgress(70)
-            if feedback.isCanceled():
+            if result is None:
                 return {}
-
-            if lines is None:
-                feedback.reportError(
-                    self.tr(
-                        "No se detectó ninguna línea. Probá bajar 'Umbral de Hough' "
-                        "o 'Longitud mínima de línea', o revisar el umbral de binarización."
-                    ),
-                    fatalError=False,
-                )
-                lines = []
-            else:
-                lines = lines.reshape(-1, 4)
-
-            # La dirección dominante se calcula siempre que haya segmentos (no
-            # solo si el filtro de ángulo está activado), porque también hace
-            # falta para auto-calibrar la distancia de fusión más abajo.
-            dominant_angle, concentration = (None, 0.0)
-            if len(lines) > 0:
-                dominant_angle, concentration = estimate_dominant_angle_deg(lines)
-
-            if len(lines) > 0 and filter_angle and dominant_angle is not None:
-                n_before = len(lines)
-                lines = filter_lines_by_angle(lines, dominant_angle, angle_filter_tol)
-                feedback.pushInfo(
-                    self.tr(
-                        f"Dirección dominante detectada: {dominant_angle:.1f}° "
-                        f"(concentración: {concentration:.2f}, 0=dispersa, 1=muy "
-                        f"alineada). Segmentos: {n_before} -> {len(lines)} tras "
-                        f"filtrar a ±{angle_filter_tol}°."
-                    )
-                )
-                if concentration < 0.15:
-                    feedback.reportError(
-                        self.tr(
-                            "Concentración muy baja: no hay una dirección "
-                            "claramente dominante entre los segmentos detectados. "
-                            "El ángulo elegido puede no corresponder a la hilera "
-                            "real — revisá el resultado visualmente, o probá "
-                            "activar el cierre morfológico y/o bajar el umbral "
-                            "de Hough para que se detecten más bordes de hilera "
-                            "reales antes de filtrar."
-                        ),
-                        fatalError=False,
-                    )
-                if len(lines) == 0:
-                    feedback.reportError(
-                        self.tr(
-                            "El filtro de dirección dominante eliminó todos los "
-                            "segmentos. Subí la tolerancia de ángulo o desactivá "
-                            "el filtro."
-                        ),
-                        fatalError=False,
-                    )
-
-            if len(lines) > 0 and merge_lines:
-                feedback.pushInfo(
-                    self.tr(f"Fusionando {len(lines)} segmentos en líneas de hilera completas...")
-                )
-                if merge_dist_tol_param is not None and merge_dist_tol_param > 0:
-                    merge_dist_tol = merge_dist_tol_param
-                else:
-                    merge_dist_tol = None
-                    if dominant_angle is not None:
-                        spacing_px = estimate_perp_spacing_px(lines, dominant_angle)
-                        if spacing_px is not None and spacing_px > 0:
-                            merge_dist_tol = spacing_px * 0.4
-                            feedback.pushInfo(
-                                self.tr(
-                                    f"Distancia de fusión automática: separación "
-                                    f"real entre hileras estimada en {spacing_px:.1f} px "
-                                    f"-> tolerancia de fusión = {merge_dist_tol:.1f} px "
-                                    "(40% de esa separación, para no fusionar hileras "
-                                    "vecinas entre sí)."
-                                )
-                            )
-                    if merge_dist_tol is None:
-                        merge_dist_tol = 30.0
-                        feedback.reportError(
-                            self.tr(
-                                "No se pudo estimar automáticamente la separación "
-                                "entre hileras (pocos segmentos o sin dirección "
-                                "clara). Usando 30 px por defecto — si tus hileras "
-                                "están muy juntas, esto puede fusionar de más: "
-                                "poné un valor manual más chico."
-                            ),
-                            fatalError=False,
-                        )
-
-                max_gap_px = merge_max_gap_param if merge_max_gap_param is not None and merge_max_gap_param > 0 else None
-
-                if merge_max_length_m is not None and merge_max_length_m > 0:
-                    if raster_is_geographic:
-                        feedback.reportError(
-                            self.tr(
-                                "El raster está en un CRS geográfico (grados, no metros): la "
-                                "'Longitud máxima de fusión' en metros no se puede convertir "
-                                "correctamente a píxeles. Reproyectá el raster a un CRS proyectado."
-                            ),
-                            fatalError=False,
-                        )
-                    max_length_px = merge_max_length_m / pixel_size_avg
-                else:
-                    max_length_px = None
-
-                lines = merge_segments_into_rows(
-                    lines, merge_angle_tol, merge_dist_tol, max_length_px, max_gap_px
-                )
-                feedback.pushInfo(self.tr(f"Resultado: {len(lines)} hileras."))
+            lines, row_ids, line_lots, line_periods, line_flags = result
+            clipped_by_lot = True
+            feedback.pushInfo(
+                self.tr(f"Total: {len(lines)} líneas en {len(set(line_lots))} lote(s) con hileras.")
+            )
+        else:
+            result = self._detect_rows_profile(
+                cv2, exg, valid, pixel_size_avg, geotransform, row_spacing_m,
+                sensitivity, min_line_length, merge_max_gap_param, feedback,
+                aux=brightness,
+                green_fn=(None if rgb is None else (lambda: 2.0 * rgb[1] - rgb[0] - rgb[2])),
+                stripe_mode=stripe_mode,
+                chroma_fn=(None if rgb is None else (lambda s: chroma_exg(cv2, rgb[0], rgb[1], rgb[2], valid, s))),
+            )
+            if result is None:
+                return {}
+            lines, row_ids, row_period_px = result
+            line_flags = [", ".join(self._doubts)] * len(lines)
+        del brightness
 
         # --- Recorte estricto al contorno de la parcela (y, en el método de
         # perfil, extensión de cada hilera hasta el borde del contorno) ---
@@ -3444,13 +3297,12 @@ class DetectCropRowsAlgorithm(QgsProcessingAlgorithm):
             return {}
         contour_geom = None
         if not clipped_by_lot:
-            contour_geom = self._contour_geometry(
-                contour_source, raster_layer.crs(), context, gdal, valid, geotransform, feedback
-            )
+            # sin lotes (ni cuarteles detectados): el área con datos de la imagen
+            contour_geom = self._data_area_geometry(gdal, valid, geotransform, feedback)
         if contour_geom is not None and len(lines) > 0:
             ext_px = (
                 extend_max_m / pixel_size_avg
-                if method == self.METHOD_PROFILE and extend_max_m is not None and extend_max_m > 0
+                if extend_max_m is not None and extend_max_m > 0
                 else 0.0
             )
             len_before = sum(math.hypot(x2 - x1, y2 - y1) for x1, y1, x2, y2 in lines) * pixel_size_avg
@@ -3458,9 +3310,8 @@ class DetectCropRowsAlgorithm(QgsProcessingAlgorithm):
             lines, row_ids = self._fit_lines_to_contour(
                 gdal, lines, row_ids, contour_geom, geotransform, ext_px,
                 valid.shape, min_line_length,
-                cross_tol_px=(self.ROW_TOL * row_period_px
-                              if method == self.METHOD_PROFILE and row_period_px else 0.0),
-                period_px=row_period_px if method == self.METHOD_PROFILE else None,
+                cross_tol_px=self.ROW_TOL * row_period_px if row_period_px else 0.0,
+                period_px=row_period_px,
             )
             len_after = sum(math.hypot(x2 - x1, y2 - y1) for x1, y1, x2, y2 in lines) * pixel_size_avg
             if ext_px > 0:
@@ -3485,61 +3336,6 @@ class DetectCropRowsAlgorithm(QgsProcessingAlgorithm):
             y = geotransform[3] + col * geotransform[4] + row * geotransform[5]
             return x, y
 
-        # --- Preparar cálculo de cobertura / conteo de plantas, si corresponde ---
-        half_width_px = None
-        half_widths = None  # por línea, cuando cada lote tiene su separación
-        min_plant_area_px = None
-
-        if calc_coverage or calc_plant_count:
-            if raster_is_geographic:
-                feedback.reportError(
-                    self.tr(
-                        "El raster está en un CRS geográfico (grados, no metros). "
-                        "Los cálculos de cobertura/conteo van a ser incorrectos: "
-                        "reproyectá el raster a un CRS proyectado (metros) antes de correr esto."
-                    ),
-                    fatalError=False,
-                )
-
-            if (coverage_width_m is None or coverage_width_m < 0) and line_periods is not None:
-                half_widths = [p / 2.0 for p in line_periods]
-                feedback.pushInfo(
-                    self.tr(
-                        "Ancho automático de franja cultivable: media separación entre "
-                        "hileras de cada lote, a cada lado de la hilera."
-                    )
-                )
-            elif coverage_width_m is None or coverage_width_m < 0:
-                if row_period_px is not None:
-                    spacing_px = row_period_px  # método de perfil: medido por FFT
-                else:
-                    spacing_px = estimate_row_spacing_px(lines)
-                if spacing_px is None:
-                    feedback.reportError(
-                        self.tr(
-                            "No se pudo estimar el ancho automático de la franja "
-                            "cultivable (se necesitan al menos 2 hileras detectadas). "
-                            "Especificá un ancho manual en metros, o revisá la detección."
-                        ),
-                        fatalError=False,
-                    )
-                else:
-                    half_width_px = spacing_px / 2.0
-                    feedback.pushInfo(
-                        self.tr(
-                            f"Ancho automático de franja cultivable: "
-                            f"{half_width_px * pixel_size_avg:.2f} m a cada lado de la hilera "
-                            f"(según espaciado detectado entre hileras)."
-                        )
-                    )
-            else:
-                half_width_px = coverage_width_m / pixel_size_avg
-                feedback.pushInfo(
-                    self.tr(f"Ancho manual de franja cultivable: {coverage_width_m} m a cada lado de la hilera.")
-                )
-
-            min_plant_area_px = min_plant_area_m2 / pixel_area_m2
-
         fields = QgsFields()
         fields.append(QgsField("id", QVariant.Int))
         fields.append(QgsField("longitud_m", QVariant.Double))
@@ -3555,11 +3351,6 @@ class DetectCropRowsAlgorithm(QgsProcessingAlgorithm):
         if line_flags is not None:
             # vacío = sin dudas; si no, motivos: rumbo, franja, cobertura
             fields.append(QgsField("revisar", QVariant.String))
-        if calc_coverage:
-            fields.append(QgsField("cobertura_pct", QVariant.Double))
-        if calc_plant_count:
-            fields.append(QgsField("num_plantas_est", QVariant.Int))
-            fields.append(QgsField("area_prom_planta_m2", QVariant.Double))
 
         (sink, dest_id) = self.parameterAsSink(
             parameters,
@@ -3573,7 +3364,6 @@ class DetectCropRowsAlgorithm(QgsProcessingAlgorithm):
             raise QgsProcessingException(self.tr("No se pudo crear la capa de salida."))
 
         feedback.pushInfo(self.tr(f"Escribiendo {len(lines)} segmentos detectados..."))
-        coberturas = []
         for i, (x1, y1, x2, y2) in enumerate(lines):
             mx1, my1 = pixel_to_map(x1, y1)
             mx2, my2 = pixel_to_map(x2, y2)
@@ -3589,33 +3379,10 @@ class DetectCropRowsAlgorithm(QgsProcessingAlgorithm):
             if line_flags is not None:
                 attrs.append(line_flags[i])
 
-            if calc_coverage or calc_plant_count:
-                hw = half_widths[i] if half_widths is not None else half_width_px
-                if hw is not None:
-                    row_stats = compute_row_coverage_and_count(
-                        cv2, binary, x1, y1, x2, y2,
-                        hw, min_plant_area_px, pixel_area_m2,
-                    )
-                else:
-                    row_stats = {"cobertura_pct": None, "num_plantas": None, "area_prom_m2": None}
-
-                if calc_coverage:
-                    attrs.append(row_stats["cobertura_pct"])
-                    if row_stats["cobertura_pct"] is not None:
-                        coberturas.append(row_stats["cobertura_pct"])
-                if calc_plant_count:
-                    attrs.append(row_stats["num_plantas"])
-                    attrs.append(row_stats["area_prom_m2"])
-
             feat = QgsFeature(fields)
             feat.setGeometry(QgsGeometry.fromPolylineXY([QgsPointXY(mx1, my1), QgsPointXY(mx2, my2)]))
             feat.setAttributes(attrs)
             sink.addFeature(feat)
-
-        if calc_coverage and coberturas:
-            feedback.pushInfo(
-                self.tr(f"Cobertura promedio de todas las hileras: {sum(coberturas) / len(coberturas):.1f}%")
-            )
 
         results = {self.OUTPUT: dest_id}
         if auto_info:
@@ -3637,10 +3404,79 @@ class DetectCropRowsAlgorithm(QgsProcessingAlgorithm):
                     bsink.addFeature(ft)
                 results[self.OUT_BLOCKS] = bdest
 
+        if detect_failures and len(lines) > 0 and not feedback.isCanceled():
+            # Las hileras ya están escritas: un problema en las fallas solo da
+            # un aviso y no toca las líneas.
+            try:
+                self._failures(parameters, context, feedback, results, lines, line_lots, row_ids,
+                               pixel_to_map, r, g, b, valid, geotransform, pixel_size_avg,
+                               raster_layer.crs(), fail_threshold, fail_min_len)
+            except Exception as e:
+                feedback.reportError(
+                    self.tr(f"No se pudieron calcular las fallas ({e}); las hileras no se ven afectadas."),
+                    fatalError=False,
+                )
+
         feedback.setProgress(100)
         ds = None  # cerrar dataset de GDAL
 
         return results
+
+    def _failures(self, parameters, context, feedback, results, lines, line_lots, row_ids,
+                  pixel_to_map, r, g, b, valid, gt, px, crs, umbral, min_len):
+        """Fallas por hilera sobre las líneas detectadas (ver fallas.py), solo si
+        la imagen tiene detalle real suficiente (dron)."""
+        from .fallas import fine_detail, failures_by_lot
+        feedback.pushInfo(self.tr("Fallas por hilera: midiendo el detalle real de la imagen..."))
+        if gt[2] != 0 or gt[4] != 0 or gt[1] <= 0 or gt[5] >= 0:
+            # el recorte por cuartel (fallas._tile) supone el norte arriba; con
+            # un raster "sur arriba" no encontraba ninguna falla, sin avisar
+            feedback.reportError(self.tr(
+                "Fallas por hilera omitidas: el raster está rotado o no tiene el norte arriba."),
+                fatalError=False)
+            return
+        # el detalle se mide donde están las hileras: en el centro de las más largas
+        order = sorted(range(len(lines)), key=lambda i: -math.hypot(lines[i][2] - lines[i][0], lines[i][3] - lines[i][1]))
+        pick = [order[int(k)] for k in np.unique(np.linspace(0, min(len(order), 40) - 1, 5).round())]
+        centers = [((lines[i][0] + lines[i][2]) / 2.0, (lines[i][1] + lines[i][3]) / 2.0) for i in pick]
+        ok, loss, why = fine_detail(r, g, b, valid, px, centers)
+        if not ok:
+            feedback.reportError(self.tr(
+                f"Fallas por hilera omitidas: {why}. Las fallas solo se pueden ver con imágenes de dron; "
+                "las hileras salen igual."), fatalError=False)
+            return
+        feedback.pushInfo(self.tr(
+            f"Detalle real suficiente (al llevar la imagen a 0,2 m pierde el {100 * loss:.0f}% del detalle): "
+            "se buscan fallas."))
+        segs = []
+        for x1, y1, x2, y2 in lines:
+            (ax, ay), (bx, by) = pixel_to_map(x1, y1), pixel_to_map(x2, y2)
+            segs.append((ax, ay, bx, by))
+        fallas = failures_by_lot(
+            segs, line_lots, row_ids, r, g, b, valid, gt, umbral=umbral, min_falla=min_len,
+            log=lambda m: feedback.pushInfo(self.tr(m)),
+            warn=lambda m: feedback.reportError(self.tr(m), fatalError=False),
+            canceled=feedback.isCanceled)
+        ffields = QgsFields()
+        for nm, tp in (("lote", QVariant.Int), ("hilera", QVariant.Int), ("ini_m", QVariant.Double),
+                       ("largo_m", QVariant.Double), ("vigor", QVariant.Double), ("borde", QVariant.Int)):
+            ffields.append(QgsField(nm, tp))
+        fsink, fdest = self.parameterAsSink(
+            parameters, self.OUT_FAILURES, context, ffields, QgsWkbTypes.LineString, crs)
+        if fsink is None:
+            return
+        for fa in fallas:
+            ft = QgsFeature(ffields)
+            ft.setGeometry(QgsGeometry.fromPolylineXY(
+                [QgsPointXY(fa["x1"], fa["y1"]), QgsPointXY(fa["x2"], fa["y2"])]))
+            ft.setAttributes([fa["lote"], fa["hilera"], round(fa["ini_m"], 2), round(fa["largo_m"], 2),
+                              round(fa["vigor"], 3), int(fa["borde"])])
+            fsink.addFeature(ft)
+        results[self.OUT_FAILURES] = fdest
+        n_b = sum(1 for fa in fallas if fa["borde"])
+        feedback.pushInfo(self.tr(
+            f"Fallas por hilera: {len(fallas)} ({sum(fa['largo_m'] for fa in fallas):.0f} m); {n_b} de borde "
+            "(a menos de 2 m de la punta de la hilera: dependen de dónde termina la línea)."))
 
     def _auto_lots(self, exg, brightness, valid, pixel_size_avg, geotransform, feedback):
         """Cuarteles detectados de la imagen: zonas con patrón de hileras (ver
@@ -3655,7 +3491,22 @@ class DetectCropRowsAlgorithm(QgsProcessingAlgorithm):
             feedback.pushInfo(self.tr("Raster rotado: no se detectan cuarteles, se usa toda el área con datos."))
             return [], []
         det_info = {}
-        blocks = detect_blocks(exg, brightness, valid, pixel_size_avg, info=det_info)
+        try:
+            blocks = detect_blocks(exg, brightness, valid, pixel_size_avg, info=det_info)
+        except Exception as err:
+            if self._out_of_memory(err):
+                raise
+            # p. ej. una imagen de pocos metros de lado: sin cuarteles, se sigue
+            # con toda el área con datos en vez de cortar la corrida
+            feedback.reportError(
+                self.tr(
+                    f"No se pudieron buscar los cuarteles ({type(err).__name__}: {err}): se usa toda "
+                    "el área con datos."
+                ),
+                fatalError=False,
+            )
+            feedback.pushInfo(traceback.format_exc())
+            return [], []
         if not blocks:
             feedback.pushInfo(self.tr(
                 "No se encontró ninguna zona con patrón de hileras (hileras de 1 a 8 m): "
@@ -3667,8 +3518,7 @@ class DetectCropRowsAlgorithm(QgsProcessingAlgorithm):
                 [QgsPointXY(gt[0] + x * gt[1], gt[3] + y * gt[5]) for x, y in ring]
                 for ring in b["rings"][:1]
             ])
-            if not geom.isGeosValid():
-                geom = geom.makeValid()
+            geom = self._valid_polygon(geom)
             if geom.isEmpty():
                 continue
             th = math.radians(b["ang"])
@@ -3684,27 +3534,11 @@ class DetectCropRowsAlgorithm(QgsProcessingAlgorithm):
                 f"~{d['per_m']:.2f} m (el patrón explica {100 * d['ratio']:.0f}% del contraste local)."))
         return lots, info
 
-    def _contour_geometry(self, source, raster_crs, context, gdal, valid, geotransform, feedback):
-        """Geometría del contorno de la parcela, en el CRS del raster: la capa
-        de contorno si se dio (unión de todos sus polígonos), o si no el área
-        con datos del raster (máscara alfa/nodata vectorizada). None si no
-        hay contorno ni píxeles sin datos (nada que recortar)."""
-        if source is not None:
-            request = QgsFeatureRequest().setDestinationCrs(raster_crs, context.transformContext())
-            geoms = [f.geometry() for f in source.getFeatures(request) if f.hasGeometry()]
-            if not geoms:
-                raise QgsProcessingException(self.tr("La capa de contorno no tiene geometrías."))
-            geom = QgsGeometry.unaryUnion(geoms)
-            if not geom.isGeosValid():
-                geom = geom.makeValid()
-            feedback.pushInfo(
-                self.tr(
-                    f"Contorno de la parcela: {len(geoms)} polígono(s), "
-                    f"{geom.area() / 10000.0:.2f} ha."
-                )
-            )
-            return geom
-
+    def _data_area_geometry(self, gdal, valid, geotransform, feedback):
+        """Área con datos del raster (máscara alfa/nodata vectorizada), en su
+        CRS: el contorno cuando no hay lotes. None si no hay píxeles sin datos
+        (nada que recortar). Con una capa de lotes, cada polígono se procesa y
+        se recorta por su cuenta (ver _detect_rows_by_lot) y esto no se usa."""
         if valid.all():
             return None
 
@@ -3753,9 +3587,7 @@ class DetectCropRowsAlgorithm(QgsProcessingAlgorithm):
         for f in source.getFeatures(request):
             if not f.hasGeometry():
                 continue
-            geom = f.geometry()
-            if not geom.isGeosValid():
-                geom = geom.makeValid()
+            geom = self._valid_polygon(f.geometry())
             if geom.isEmpty() or geom.area() <= 0:
                 continue
             spacing = None
@@ -3767,6 +3599,20 @@ class DetectCropRowsAlgorithm(QgsProcessingAlgorithm):
                     spacing = None
             out.append((geom, spacing))
         return [(i + 1, geom, spacing) for i, (geom, spacing) in enumerate(out)]
+
+    @staticmethod
+    def _valid_polygon(geom):
+        """geom reparada (makeValid) y reducida a sus partes poligonales. Al
+        reparar un polígono dibujado con una "espina" (un vértice que va y
+        vuelve por la misma línea, un desliz común al digitalizar), makeValid
+        devuelve una colección con el polígono y una línea suelta, que no se
+        puede rasterizar: cortaba la corrida entera con un error técnico."""
+        if not geom.isGeosValid():
+            geom = geom.makeValid()
+        if geom.type() != QgsWkbTypes.PolygonGeometry:
+            parts = [p for p in geom.asGeometryCollection() if p.type() == QgsWkbTypes.PolygonGeometry]
+            geom = QgsGeometry.unaryUnion(parts) if parts else QgsGeometry()
+        return geom
 
     @staticmethod
     def _sweep_across_rows(geom, gt, angle_deg, tol_px, steps=4):
@@ -3786,10 +3632,7 @@ class DetectCropRowsAlgorithm(QgsProcessingAlgorithm):
             g = QgsGeometry(geom)
             g.translate(dx * k / steps, dy * k / steps)
             parts.append(g)
-        out = QgsGeometry.unaryUnion(parts)
-        if not out.isGeosValid():
-            out = out.makeValid()
-        return out
+        return DetectCropRowsAlgorithm._valid_polygon(QgsGeometry.unaryUnion(parts))
 
     @staticmethod
     def _polygon_mask(cv2, geom, inv, r0, c0, h, w):
@@ -3888,18 +3731,40 @@ class DetectCropRowsAlgorithm(QgsProcessingAlgorithm):
                                 chroma_exg(cv2, rgb[0][r0:r1, c0:c1], rgb[1][r0:r1, c0:c1],
                                            rgb[2][r0:r1, c0:c1], vc, s))),
                 )
+                if res is None:
+                    return None
+                l_lines, l_ids, period = res
+                l_lines = [(x1 + c0, y1 + r0, x2 + c0, y2 + r0) for x1, y1, x2, y2 in l_lines]
+                if l_lines:
+                    l_lines, l_ids = self._fit_lines_to_contour(
+                        gdal, l_lines, l_ids, geom, gt, ext_px, valid.shape, min_line_length,
+                        cross_tol_px=self.ROW_TOL * period, period_px=period,
+                    )
             except QgsProcessingException as err:
                 feedback.reportError(self.tr(f"Lote {lot_id}: {err}"), fatalError=False)
                 continue
-            if res is None:
-                return None
-            l_lines, l_ids, period = res
-            l_lines = [(x1 + c0, y1 + r0, x2 + c0, y2 + r0) for x1, y1, x2, y2 in l_lines]
-            if l_lines:
-                l_lines, l_ids = self._fit_lines_to_contour(
-                    gdal, l_lines, l_ids, geom, gt, ext_px, valid.shape, min_line_length,
-                    cross_tol_px=self.ROW_TOL * period, period_px=period,
+            except Exception as err:
+                # Un error inesperado en un lote no tiene que perder los demás
+                # (antes cortaba la corrida entera, sin ninguna línea): se avisa,
+                # se deja el detalle en el log y se sigue.
+                if self._out_of_memory(err):
+                    feedback.reportError(
+                        self.tr(
+                            f"Lote {lot_id}: no alcanzó la memoria para procesarlo. Se omite y se sigue "
+                            "con los demás; probá con un lote más chico o una imagen de menor resolución."
+                        ),
+                        fatalError=False,
+                    )
+                    continue
+                feedback.reportError(
+                    self.tr(
+                        f"Lote {lot_id}: error inesperado ({type(err).__name__}: {err}). Se omite este "
+                        "lote y se sigue con los demás; el detalle técnico queda en el log."
+                    ),
+                    fatalError=False,
                 )
+                feedback.pushInfo(traceback.format_exc())
+                continue
             lines += l_lines
             ids += l_ids
             lots_out += [lot_id] * len(l_lines)
@@ -3923,9 +3788,9 @@ class DetectCropRowsAlgorithm(QgsProcessingAlgorithm):
                               ext_px, shape, min_len_px, cross_tol_px=0.0, period_px=None):
         """Recorta las líneas (píxeles) al contorno y, con ext_px > 0,
         extiende los extremos de cada hilera hasta el borde (ver
-        fit_intervals_to_contour). Con row_ids (método de perfil) los tramos
-        de una misma hilera se tratan juntos; sin row_ids (Hough) cada línea
-        por separado. Con cross_tol_px > 0 (método de perfil), una hilera de
+        fit_intervals_to_contour). Los tramos de una misma hilera (row_ids)
+        se tratan juntos; sin row_ids, cada línea por separado. Con
+        cross_tol_px > 0, una hilera de
         borde (dibujada sobre el borde del contorno, o apenas afuera, y por
         eso cortada por él) se recorta con la paralela a cross_tol_px hacia
         adentro del lote, y se conserva entera; las demás se recortan contra
@@ -4072,8 +3937,9 @@ class DetectCropRowsAlgorithm(QgsProcessingAlgorithm):
         if angle is None:
             raise QgsProcessingException(
                 self.tr(
-                    "No se pudo estimar la orientación de las hileras (raster "
-                    "demasiado chico o sin suficientes píxeles válidos)."
+                    "No se pudo estimar la orientación de las hileras: la zona es "
+                    "demasiado chica, casi no tiene píxeles con datos o es uniforme "
+                    "(sin nada que distinguir, como el fondo de un recorte)."
                 )
             )
         mc = fft_info.get("marco")
@@ -4229,8 +4095,7 @@ class DetectCropRowsAlgorithm(QgsProcessingAlgorithm):
                     f"La separación entre hileras estimada es de {period_full:.1f} px "
                     f"({period_full * pixel_size_avg:.2f} m): con menos de ~3 píxeles por "
                     "hilera no hay forma de distinguirlas a esta resolución. Si la "
-                    "separación real es otra, indicala en 'Distancia aproximada entre "
-                    "hileras'."
+                    "separación real es otra, indicala en 'Distancia entre hileras'."
                 )
             )
         if work.shape[0] + work.shape[1] > 32000:
@@ -4250,6 +4115,8 @@ class DetectCropRowsAlgorithm(QgsProcessingAlgorithm):
         # C_NOT_GREEN). Con el ángulo ya afinado, para que el perfil a lo
         # ancho no se borronee.
         shadow_frac = 0.0   # sombra respecto de la canopia (fracción de T, con signo)
+        dark_not_green = False   # franja oscura porque la canopia no se ve verde (ver HALF_MIN_T)
+        dark_no_green_at_all = False   # ídem, con la canopia nada verde (verdor < C_NOT_GREEN)
         if green_fn is not None and aux is not None and stripe_mode == self.STRIPE_AUTO:
             dark_now = not aux_is_brightness
             c_w, y_w = (aux, -work) if dark_now else (work, aux)
@@ -4259,6 +4126,8 @@ class DetectCropRowsAlgorithm(QgsProcessingAlgorithm):
                 if not dark_now and c_pk < self.C_NOT_GREEN:
                     work, aux = -y_w, c_w
                     aux_is_brightness = False
+                    dark_not_green = True
+                    dark_no_green_at_all = True
                     feedback.pushInfo(
                         self.tr(
                             "Franja de la hilera: la oscura. La canopia no se ve verde en la "
@@ -4273,6 +4142,7 @@ class DetectCropRowsAlgorithm(QgsProcessingAlgorithm):
                 elif not dark_now and c_pk < self.C_GREEN_CANOPY and off > self.DARK_OFFSET_MAX:
                     work, aux = -y_w, c_w
                     aux_is_brightness = False
+                    dark_not_green = True
                     feedback.pushInfo(
                         self.tr(
                             "Franja de la hilera: la oscura. La canopia apenas se ve verde "
@@ -4281,6 +4151,20 @@ class DetectCropRowsAlgorithm(QgsProcessingAlgorithm):
                             "suelo o la cobertura entre hileras, y las plantas, que absorben más luz, "
                             "quedan como la franja oscura. Revisá que las líneas caigan sobre las "
                             "plantas; si no, elegí la franja en 'Franja de la hilera'."
+                        )
+                    )
+                elif not dark_now and c_pk >= self.C_GREEN_CANOPY and off > self.DARK_OFFSET_MAX:
+                    # canopia verde con la sombra al costado, con el verdor ya
+                    # como índice: se sigue con el verdor, pero la reubicación
+                    # por el brillo tiene que apuntar a la canopia y no a la
+                    # sombra (ver C_GREEN_CANOPY)
+                    shadow_frac = off_sgn
+                    feedback.pushInfo(
+                        self.tr(
+                            "Franja de la hilera: la más verde. La franja oscura está corrida "
+                            f"{off:.0%} de la separación respecto de la más verde, que es "
+                            f"canopia verde (verdor {c_pk:.2f}): la oscura es la sombra al "
+                            "costado de la canopia, no la hilera."
                         )
                     )
                 elif dark_now and c_pk >= self.C_GREEN_CANOPY and off > self.DARK_OFFSET_MAX:
@@ -4378,13 +4262,13 @@ class DetectCropRowsAlgorithm(QgsProcessingAlgorithm):
                                 f"valor absoluto: {g_mid / max(g_pk, 1e-9):.1f} veces). Las "
                                 "hileras se ubican sobre las copas iluminadas (verde absoluto "
                                 "2G-R-B). Si en este lote la franja clara es pasto entre "
-                                "hileras, elegí 'Franja más verde' en 'Franja de la hilera'."
+                                "hileras, elegí 'La más verde' en 'Franja de la hilera'."
                             )
                         )
                         doubts.append((
                             "franja",
                             "se aplicó copa cerrada (líneas sobre las copas al sol); si la "
-                            "franja clara es pasto entre hileras, elegí 'Franja más verde'",
+                            "franja clara es pasto entre hileras, elegí 'La más verde' en 'Franja de la hilera'",
                         ))
             elif use_green:
                 feedback.pushInfo(self.tr("Franja de la hilera: copas iluminadas (verde absoluto 2G-R-B), elegida por el usuario."))
@@ -4419,7 +4303,7 @@ class DetectCropRowsAlgorithm(QgsProcessingAlgorithm):
                     "El pico espectral es bajo: no se ve una periodicidad clara de "
                     "hileras. Revisá que el rumbo y la separación del mensaje "
                     "anterior sean los reales; si no, indicá la 'Distancia "
-                    "aproximada entre hileras'."
+                    "entre hileras'."
                 ),
                 fatalError=False,
             )
@@ -4434,6 +4318,14 @@ class DetectCropRowsAlgorithm(QgsProcessingAlgorithm):
             return None
 
         max_gap_px = max_gap_param if max_gap_param is not None and max_gap_param > 0 else 0.0
+        # Centro de la banda (ver BAND_MAX_T y BAND_GAIN_NOT_GREEN): solo con
+        # la franja oscura (el índice es el brillo) y no en la zona gris.
+        band_gain = None
+        if aux is not None and not aux_is_brightness and not sunlit:
+            if dark_no_green_at_all:
+                band_gain = self.BAND_GAIN_NOT_GREEN
+            elif not dark_not_green:
+                band_gain = self.BAND_GAIN_BRIGHT
         sample_w, row_w = work_valid, None
         if cross_masks is not None:
             sample_m, row_m = cross_masks(angle, period_full)
@@ -4452,7 +4344,12 @@ class DetectCropRowsAlgorithm(QgsProcessingAlgorithm):
             track_max_px=TRACK_MAX_M / max(pixel_size_avg * f, 1e-9),
             aux_siembra=aux is not None and not aux_is_brightness,
             shadow_px=shadow_frac * period_w,
+            half_center=dark_not_green,
+            band_gain=band_gain,
+            canceled=feedback.isCanceled,
         )
+        if feedback.isCanceled():
+            return None
         # centro de píxel a centro de píxel entre resoluciones
         lines = [tuple((v + 0.5) * f - 0.5 for v in seg) for seg in segs_w]
 
@@ -4473,7 +4370,8 @@ class DetectCropRowsAlgorithm(QgsProcessingAlgorithm):
                     f"{info.get('extendidas_por_plantas', 0)} hileras completadas planta por "
                     f"planta (plantas chicas), {info.get('seguidas', 0)} hileras seguidas de "
                     f"costado (levemente torcidas; {info.get('tramos_reajustados', 0)} tramos "
-                    f"reajustados), {info.get('descartados_por_nivel', 0)} tramos "
+                    f"reajustados), {info.get('sembradas_debiles', 0)} tramos de evidencia "
+                    f"débil pero sostenida, {info.get('descartados_por_nivel', 0)} tramos "
                     f"descartados por no tener el nivel de una hilera (huellas, sombras en la "
                     f"calle), {len(lines)} "
                     f"tramos (umbral de contraste {info['tau']:.3g} = "
@@ -4486,6 +4384,48 @@ class DetectCropRowsAlgorithm(QgsProcessingAlgorithm):
                     "Entrehileras alternadas (rastra o cobertura hilera por medio): de un "
                     "lado de cada hilera el suelo es claro y del otro la cobertura se ve casi "
                     "igual a las plantas; alcanza con que la hilera se distinga del lado claro."
+                )
+            )
+        if info.get("centro_banda"):
+            p_pk, p_bc = info["banda_presencia"]
+            feedback.pushInfo(
+                self.tr(
+                    f"Hileras en el centro de su banda oscura ({info['centro_banda']} movidas desde lo "
+                    "más oscuro): la banda tiene dos jorobas (camellón) o lo más oscuro es la sombra, "
+                    f"a un costado; desde el centro la hilera se ve en {p_bc / max(p_pk, 1.0):.1f} veces "
+                    "más largo."
+                )
+            )
+        if info.get("pendiente_propia"):
+            prop_ = info.get("pendiente_propagada", 0)
+            feedback.pushInfo(
+                self.tr(
+                    f"{info['pendiente_propia']} hileras con rumbo propio, levemente distinto del "
+                    "del lote (hileras no del todo paralelas)"
+                    + (f"; {prop_} de ellas, siguiendo el rumbo de su vecina." if prop_ else ".")
+                )
+            )
+        if info.get("rellenos_vecinas"):
+            feedback.pushInfo(
+                self.tr(
+                    f"{info['rellenos_vecinas']} huecos o puntas de hileras tenues completados donde "
+                    "sus dos vecinas siguen (la hilera sigue siendo más oscura que sus entrehileras)."
+                )
+            )
+        if info.get("cortes_transversales"):
+            feedback.pushInfo(
+                self.tr(
+                    f"{info['cortes_transversales']} cortes transversales (reguera, acequia o camino "
+                    "que cruza las hileras): las líneas se cortan donde los huecos de muchas hileras "
+                    "seguidas caen sobre una misma recta."
+                )
+            )
+        if info.get("centro_media_altura"):
+            feedback.pushInfo(
+                self.tr(
+                    "Banda oscura asimétrica: lo más oscuro es la sombra, a un costado, y la "
+                    "planta queda del otro lado. Las líneas se corrieron "
+                    f"{abs(info['centro_media_altura']) * f * pixel_size_avg:.2f} m al centro de la banda."
                 )
             )
         if info.get("descartados_cortina"):
@@ -4548,3 +4488,4 @@ class DetectCropRowsAlgorithm(QgsProcessingAlgorithm):
             )
         self._doubts = sorted({c_ for c_, _ in doubts})
         return lines, row_ids, period_full
+

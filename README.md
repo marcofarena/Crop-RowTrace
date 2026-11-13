@@ -39,7 +39,7 @@ O bien descargar el ZIP desde GitHub (`Code > Download ZIP`), descomprimirlo y c
 
 ## Uso
 
-1. Abrí el ortomosaico en QGIS. Tiene que tener las bandas R, G y B y estar en un CRS proyectado en metros (UTM, por ejemplo).
+1. Abrí el ortomosaico en QGIS. Tiene que ser un archivo ráster (no una capa web), tener las bandas R, G y B y estar en un CRS proyectado en metros (UTM, por ejemplo).
 2. Abrí la caja de herramientas de Processing (`Ctrl+Alt+T`) y buscá **Hileras y fallas por cuartel (basado en verde)**.
 3. Elegí el ráster y una **carpeta de resultados**. Con los valores por defecto alcanza.
 4. Ejecutá. Puede tardar un par de minutos, según el tamaño de la imagen.
@@ -86,4 +86,15 @@ Vista general de las fallas (rojo: interiores; naranja: de borde):
 | `buffer_final.gpkg`, `hileras_iniciales.gpkg`, `picos_verde.gpkg` | Capas de las etapas intermedias, para revisar el proceso (se cargan en QGIS con la opción "Cargar también las capas de las etapas intermedias") |
 | `resumen_cuarteles.csv` | Una fila por cuartel: área, rumbo, distancia, fallas con y sin borde |
 
-El plugin incluye además los algoritmos **Detectar hileras de cultivo** (el detector original de hileras), **Inferir cuarteles a partir de las hileras** y **Perfil de vegetación y fallas por hilera**.
+## Los otros algoritmos
+
+- **Detectar hileras de cultivo** (versión 0.25). El detector por perfil de proyección orientado por FFT: una línea por hilera en imágenes de dron o satelitales (Google), con un polígono por lote o, sin lotes, con los cuarteles detectados de la imagen. Opcionalmente marca las fallas por hilera (solo con imágenes de dron). Evaluado contra 23 lotes corregidos a mano (2.059 hileras): cubre el 96,9% del largo de las hileras, el 98,0% de sus líneas cae sobre una hilera real y el F1 es 0,975. El método, los parámetros, las limitaciones y el historial de versiones están en [docs/detector.md](docs/detector.md).
+- **Inferir cuarteles a partir de las hileras** y **Perfil de vegetación y fallas por hilera**: las dos etapas del proceso por separado, para aplicarlas sobre líneas ya detectadas.
+
+## Autores
+
+Proyecto desarrollado en conjunto, en Hiko (Mendoza, Argentina), por:
+
+- **Marco Arena** ([@marcofarena](https://github.com/marcofarena)): delimitación de cuarteles (`bloques.py`, `cuarteles.py`), perfil de vegetación y fallas por hilera (`perfil.py`) y el proceso basado en verde (`verde.py`, `algorithm_verde.py`, `algorithm_cuarteles.py`, `algorithm_perfil.py`).
+- **Francesco Spigatin**: el detector de hileras (`algorithm.py`), su evaluación contra referencias corregidas a mano y la integración de los cuarteles automáticos y las fallas en el detector (`fallas.py`). Lo desarrolló durante su práctica profesional de Ingeniería Agronómica (FCA, UNCuyo) en Hiko.
+
