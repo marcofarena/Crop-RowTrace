@@ -95,6 +95,6 @@ Vista general de las fallas (rojo: interiores; naranja: de borde):
 
 Proyecto desarrollado en conjunto, en Hiko (Mendoza, Argentina), por:
 
-- **Marco Arena** ([@marcofarena](https://github.com/marcofarena)): delimitación de cuarteles (`bloques.py`, `cuarteles.py`), perfil de vegetación y fallas por hilera (`perfil.py`) y el proceso basado en verde (`verde.py`, `algorithm_verde.py`, `algorithm_cuarteles.py`, `algorithm_perfil.py`).
-- **Francesco Spigatin**: el detector de hileras (`algorithm.py`), su evaluación contra referencias corregidas a mano y la integración de los cuarteles automáticos y las fallas en el detector (`fallas.py`). Lo desarrolló durante su práctica profesional de Ingeniería Agronómica (FCA, UNCuyo) en Hiko.
+- **Marco Arena** ([@marcofarena](https://github.com/marcofarena)): delimitación de cuarteles y su conexión al detector (`bloques.py`), cuarteles a partir de las hileras (`cuarteles.py`), perfil de vegetación y fallas por hilera (`perfil.py`) y el proceso basado en verde (`verde.py`, `algorithm_verde.py`, `algorithm_cuarteles.py`, `algorithm_perfil.py`).
+- **Francesco Spigatin**: el detector de hileras (`algorithm.py`) y su evaluación contra referencias corregidas a mano. También el uso de las fallas por lote, con el control de que la imagen sea de dron (`fallas.py`). Lo desarrolló durante su práctica profesional de Ingeniería Agronómica (FCA, UNCuyo) en Hiko.
 
